@@ -1,5 +1,6 @@
 import torch
 import torch.nn.functional as F
+import numpy as np
 
 
 class MultiLayerIDDPM:
@@ -86,11 +87,15 @@ class MultiLayerIDDPM:
         sqrt_one_minus_alpha_bar = self._extract(self.iddpm.sqrt_one_minus_alphas_cumprod, t, x_start.shape)
         
         return sqrt_alpha_bar * x_start + sqrt_one_minus_alpha_bar * noise
-    
+        
     def _extract(self, arr, timesteps, broadcast_shape):
         """
         Extract values from array at timesteps and broadcast to shape.
         """
+        # numpy array → tensor 변환
+        if isinstance(arr, np.ndarray):
+            arr = torch.from_numpy(arr)
+        
         res = arr.to(timesteps.device)[timesteps].float()
         while len(res.shape) < len(broadcast_shape):
             res = res.unsqueeze(-1)

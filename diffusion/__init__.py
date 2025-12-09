@@ -7,3 +7,4 @@ from .iddpm import IDDPM
 from .dpm_solver import DPMS
 from .sa_sampler import SASolverSampler
 from .multilayer_iddpm import MultiLayerIDDPM
+from .multilayer_ref_iddpm import ReferenceIDDPM

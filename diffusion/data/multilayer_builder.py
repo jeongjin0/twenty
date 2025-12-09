@@ -221,8 +221,7 @@ def build_mulan_dataloader(
         max_layers=max_layers,
         min_layers=min_layers,
         caption_type=caption_type,
-    )
-    
+    )    
     dataloader = DataLoader(
         dataset,
         batch_size=batch_size,

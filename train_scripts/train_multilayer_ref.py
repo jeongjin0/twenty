@@ -19,7 +19,7 @@ from diffusers.models import AutoencoderKL
 from mmcv.runner import LogBuffer
 from torch.utils.data import RandomSampler
 
-from diffusion import IDDPM, MultiLayerIDDPM
+from diffusion import IDDPM, ReferenceIDDPM
 from diffusion.data.builder import build_dataset, build_dataloader, set_data_root
 from diffusion.model.builder import build_model
 from diffusion.model.t5 import T5Embedder
@@ -51,50 +51,47 @@ def reset_memory_stats():
     torch.cuda.empty_cache()
 
 
-def encode_multilayer_vae(vae, layers, num_layers, scale_factor=0.18215):
+def encode_reference_vae(vae, layers, num_layers, target_idx=0, scale_factor=0.18215):
     """
-    Encode multi-layer RGBA images to latent space.
+    타겟 레이어와 참조 레이어 분리 인코딩.
     
     Args:
-        vae: AutoencoderKL
-        layers: (B, N, 4, H, W) - RGBA layers
-        num_layers: (B,) - number of valid layers per sample
-        scale_factor: VAE scaling factor (default: 0.18215)
+        layers: (B, N, 4, H, W) - 전체 레이어
+        num_layers: (B,) - 유효 레이어 수
+        target_idx: 타겟으로 사용할 레이어 인덱스 (0=맨 아래)
     
     Returns:
-        z: (B, N, 4, h, w) - latent (scaled)
-        alpha_down: (B, N, 1, h, w) - downsampled alpha
-        layer_mask: (B, N) - 1 for valid layers, 0 for padding
+        z_target: (B, 4, h, w) - 타겟 latent
+        z_ref: (B, N-1, 4, h, w) - 참조 latents
+        ref_mask: (B, N-1) - 유효 참조 마스크
     """
     B, N, C, H, W = layers.shape
     
-    # Separate RGB and Alpha
-    rgb = layers[:, :, :3, :, :]      # (B, N, 3, H, W)
-    alpha = layers[:, :, 3:4, :, :]   # (B, N, 1, H, W)
+    # RGB만 추출
+    rgb = layers[:, :, :3, :, :]  # (B, N, 3, H, W)
     
-    # Reshape for VAE: (B*N, 3, H, W)
+    # VAE 인코딩
     rgb_flat = rgb.reshape(B * N, 3, H, W)
-    
-    # VAE encode
     with torch.no_grad():
-        posterior = vae.encode(rgb_flat).latent_dist
-        z_rgb_flat = posterior.mode() * scale_factor  # Apply scale factor here
+        z_flat = vae.encode(rgb_flat).latent_dist.mode() * scale_factor
     
-    # Reshape back: (B, N, 4, h, w)
-    _, C_latent, h, w = z_rgb_flat.shape
-    z_rgb = z_rgb_flat.reshape(B, N, C_latent, h, w)
+    _, C_latent, h, w = z_flat.shape
+    z_all = z_flat.reshape(B, N, C_latent, h, w)
     
-    # Downsample alpha to latent resolution
-    alpha_flat = alpha.reshape(B * N, 1, H, W)
-    alpha_down = F.interpolate(alpha_flat, size=(h, w), mode='bilinear', align_corners=False)
-    alpha_down = alpha_down.reshape(B, N, 1, h, w)
+    # 타겟/참조 분리
+    z_target = z_all[:, target_idx]  # (B, 4, h, w)
     
-    # Create layer mask (1 for valid, 0 for padded)
-    layer_mask = torch.zeros(B, N, device=layers.device)
-    for i, n in enumerate(num_layers):
-        layer_mask[i, :n] = 1.0
+    # 참조: 타겟 제외한 나머지
+    ref_indices = [i for i in range(N) if i != target_idx]
+    z_ref = z_all[:, ref_indices]  # (B, N-1, 4, h, w)
     
-    return z_rgb, alpha_down, layer_mask
+    # 참조 마스크 생성
+    ref_mask = torch.zeros(B, N - 1, device=layers.device)
+    for i in range(B):
+        valid_refs = min(num_layers[i].item() - 1, N - 1)  # 타겟 제외
+        ref_mask[i, :valid_refs] = 1.0
+    
+    return z_target, z_ref, ref_mask
 
 
 def set_fsdp_env():
@@ -119,6 +116,7 @@ def train():
     time_start, last_tic = time.time(), time.time()
     log_buffer = LogBuffer()
 
+    grad_norm = None
     start_step = start_epoch * len(train_dataloader)
     global_step = 0
     total_steps = len(train_dataloader) * config.num_epochs
@@ -130,86 +128,61 @@ def train():
         for step, batch in enumerate(train_dataloader):
             data_time_all += time.time() - data_time_start
             
-            # ============================================
-            # 1. Unpack MuLan batch
-            # ============================================
+            # 1. Unpack batch
             layers, captions, num_layers, image_ids = batch
-            layers = layers.to(accelerator.device)        # (B, N, 4, H, W)
-            num_layers = num_layers.to(accelerator.device)  # (B,)
-            
+            layers = layers.to(accelerator.device)
+            num_layers = num_layers.to(accelerator.device)
             B = layers.shape[0]
             N = layers.shape[1]
-            
-            # ============================================
-            # 2. VAE encoding (includes scale_factor)
-            # ============================================
+
+            # 2. VAE encoding - 타겟/참조 분리
             with torch.no_grad():
-                z, alpha_down, layer_mask = encode_multilayer_vae(
+                # 랜덤하게 타겟 레이어 선택 (또는 고정)
+                target_idx = torch.randint(0, layers.shape[1], (1,)).item()
+                
+                z_target, z_ref, ref_mask = encode_reference_vae(
                     vae, layers, num_layers,
+                    target_idx=target_idx,
                     scale_factor=config.scale_factor
                 )
-                # z: (B, N, 4, h, w) - already scaled
-                # layer_mask: (B, N) - valid layer mask
-            # ============================================
-            # 3. T5 Text encoding
-            # ============================================
+            
+            # 3. T5 encoding
             with torch.no_grad():
                 caption_embs, emb_masks = text_encoder.get_text_embeddings(captions)
-                
-                # Convert to PixArt format: (B, 1, L, D)
-                y = caption_embs.float()[:, None]  # (B, 1, L, D)
-                y_mask = emb_masks                  # (B, L)
-                # y: (B, 1, L, D)
-                # y_mask: (B, L)
-            # ============================================
+                y = caption_embs.float()[:, None]
+                y_mask = emb_masks
+            
             # 4. Sample timesteps
-            # ============================================
             timesteps = torch.randint(
                 0, config.train_sampling_steps, (B,),
                 device=accelerator.device
             ).long()
-
-            if 1==0:
-                ##review output
-                print("z shape:", z.shape)
-                print("layer_mask shape:", layer_mask.shape)
-                print("y shape:", y.shape)
-                print("y_mask shape:", y_mask.shape)
-                print("timesteps shape:", timesteps.shape)
-
-                ##preview thoose
-                print("z:", z)
-                print("layer_mask:", layer_mask)
-                print("y:", y)
-                print("y_mask:", y_mask)
-                print("timesteps:", timesteps)
-
-            # ============================================
-            # 5. Training step
-            # ============================================
-            grad_norm = None
             
+            # 5. Training step
             with accelerator.accumulate(model):
                 optimizer.zero_grad()
-                # Compute loss
+                
+                # 기본 IDDPM loss 사용 (단일 레이어)
                 loss_dict = multilayer_diffusion.training_losses(
                     model=model,
-                    x_start=z,
+                    x=z_target,  # (B, 4, h, w)
                     t=timesteps,
-                    model_kwargs=dict(y=y, mask=y_mask),
-                    layer_mask=layer_mask,
+                    model_kwargs=dict(
+                        y=y,
+                        mask=y_mask,
+                        x_ref=z_ref,  # (B, N-1, 4, h, w)
+                    ),
                 )
-                loss = loss_dict['loss'].mean()
                 
-                # Backward
+                loss = loss_dict['loss'].mean()
                 accelerator.backward(loss)
-                # Gradient clipping
+                
                 if accelerator.sync_gradients:
                     grad_norm = accelerator.clip_grad_norm_(model.parameters(), config.gradient_clip)
                 
                 optimizer.step()
                 lr_scheduler.step()
-                # EMA update
+                
                 if accelerator.sync_gradients:
                     ema_update(model_ema, model, config.ema_rate)
 
@@ -232,9 +205,9 @@ def train():
                 log_buffer.average()
                 
                 # Get latent size info
-                h, w = z.shape[-2], z.shape[-1]
+                h, w = z_target.shape[-2], z_target.shape[-1]
                 avg_layers = num_layers.float().mean().item()
-                
+
                 info = f"Step/Epoch [{(epoch-1)*len(train_dataloader)+step+1}/{epoch}][{step + 1}/{len(train_dataloader)}]: " \
                        f"total_eta: {eta}, epoch_eta: {eta_epoch}, time_all: {t:.3f}, time_data: {t_d:.3f}, " \
                        f"lr: {lr:.3e}, latent: ({h}, {w}), layers: {N} (avg: {avg_layers:.1f}), "
@@ -403,21 +376,22 @@ if __name__ == '__main__':
     )
     
     # Wrap with MultiLayer handler
-    multilayer_diffusion = MultiLayerIDDPM(base_diffusion, scale_factor=config.scale_factor)
+    multilayer_diffusion = ReferenceIDDPM(base_diffusion)
 
     # ============================================
     # Build MultiLayerPixArt Model
     # ============================================
-    from diffusion.model.nets.PixArt_multilayer import MultiLayerPixArt_XL_2
-    
-    model = MultiLayerPixArt_XL_2(
+    from diffusion.model.nets.PixArt_multilayer import ReferencePixArt_XL_2
+    model = ReferencePixArt_XL_2(
         input_size=latent_size,
         in_channels=4,
-        max_layers=max_layers,
-        caption_channels=4096,  # T5-XXL hidden size
+        max_ref_layers=max_layers - 1,  # 타겟 제외
+        ref_encoder_depth=4,
+        caption_channels=4096,
         model_max_length=config.model_max_length,
         pred_sigma=pred_sigma,
     ).train()
+
     model.enable_gradient_checkpointing()
 
     logger.info(f"Model: {model.__class__.__name__}")

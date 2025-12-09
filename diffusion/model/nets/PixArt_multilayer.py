@@ -23,7 +23,6 @@ from typing import Optional, List, Tuple
 def t2i_modulate(x, shift, scale):
     return x * (1 + scale) + shift
 
-
 def get_2d_sincos_pos_embed(embed_dim, grid_size, cls_token=False, extra_tokens=0, lewei_scale=1.0, base_size=16):
     if isinstance(grid_size, int):
         grid_size = (grid_size, grid_size)
@@ -215,7 +214,7 @@ class T2IFinalLayer(nn.Module):
 
     def forward(self, x, t):
         shift, scale = (self.scale_shift_table[None] + t.reshape(-1, 2, x.shape[-1])).chunk(2, dim=1)
-        x = t2i_modulate(self.norm_final(x), shift.squeeze(1), scale.squeeze(1))
+        x = t2i_modulate(self.norm_final(x), shift, scale)
         x = self.linear(x)
         return x
 
@@ -420,6 +419,15 @@ class MultiLayerPixArt(nn.Module):
         self.final_layer = T2IFinalLayer(hidden_size, patch_size, self.out_channels)
 
         self.initialize_weights()
+        self.gradient_checkpointing = False
+
+    def enable_gradient_checkpointing(self):
+        """Enable gradient checkpointing for memory savings."""
+        self.gradient_checkpointing = True
+
+    def disable_gradient_checkpointing(self):
+        """Disable gradient checkpointing."""
+        self.gradient_checkpointing = False
 
     def initialize_weights(self):
         def _basic_init(module):
@@ -528,8 +536,13 @@ class MultiLayerPixArt(nn.Module):
             y = y.squeeze(1).view(1, -1, D)
 
         # 6. Transformer blocks
-        for block in self.blocks:
-            x = block(x, y, t0, mask=None, num_layers=N, num_patches=T)
+        if self.gradient_checkpointing and self.training:
+            from torch.utils.checkpoint import checkpoint
+            for block in self.blocks:
+                x = checkpoint(block, x, y, t0, None, N, T, use_reentrant=False)
+        else:
+            for block in self.blocks:
+                x = block(x, y, t0, mask=None, num_layers=N, num_patches=T)
 
         # 7. Final layer
         t_final = self.t_embedder(timestep)
@@ -789,6 +802,15 @@ class ReferencePixArt(nn.Module):
         self.final_layer = T2IFinalLayer(hidden_size, patch_size, self.out_channels)
 
         self.initialize_weights()
+        self.gradient_checkpointing = False
+
+    def enable_gradient_checkpointing(self):
+        """Enable gradient checkpointing for memory savings."""
+        self.gradient_checkpointing = True
+
+    def disable_gradient_checkpointing(self):
+        """Disable gradient checkpointing."""
+        self.gradient_checkpointing = False
 
     def initialize_weights(self):
         def _basic_init(module):
@@ -834,12 +856,6 @@ class ReferencePixArt(nn.Module):
         return x.reshape(shape=(x.shape[0], c, h * p, h * p))
 
     def forward(self, x_target, timestep, y, x_ref, mask=None, **kwargs):
-        """
-        x_target: (B, C, H, W) - target layer (noisy)
-        timestep: (B,) - diffusion timesteps
-        y: (B, 1, L, caption_channels) - text embeddings
-        x_ref: (B, N_ref, C, H, W) - reference layers (clean)
-        """
         dtype = next(self.parameters()).dtype
         x_target = x_target.to(dtype)
         timestep = timestep.to(dtype)
@@ -852,12 +868,12 @@ class ReferencePixArt(nn.Module):
         x = self.x_embedder(x_target) + self.pos_embed
 
         # 2. Encode reference
-        ref_emb = self.ref_encoder(x_ref)  # (B, D)
+        ref_emb = self.ref_encoder(x_ref)
         ref_emb = self.ref_proj(ref_emb)
 
         # 3. Timestep embedding + reference conditioning
         t = self.t_embedder(timestep)
-        t = t + ref_emb  # Add reference to timestep embedding
+        t = t + ref_emb
         t0 = self.t_block(t)
 
         # 4. Text embedding
@@ -868,16 +884,19 @@ class ReferencePixArt(nn.Module):
                 mask = mask.repeat(y.shape[0] // mask.shape[0], 1)
             mask = mask.squeeze(1).squeeze(1)
             y = y.squeeze(1).masked_select(mask.unsqueeze(-1) != 0).view(1, -1, D)
-            y_lens = mask.sum(dim=1).tolist()
         else:
-            y_lens = [y.shape[2]] * y.shape[0]
             y = y.squeeze(1).view(1, -1, D)
 
-        # 5. Transformer blocks
-        for block in self.blocks:
-            x = block(x, y, t0)
+        # 5. Transformer blocks (수정됨)
+        if self.gradient_checkpointing and self.training:
+            from torch.utils.checkpoint import checkpoint
+            for block in self.blocks:
+                x = checkpoint(block, x, y, t0, None, use_reentrant=False)
+        else:
+            for block in self.blocks:
+                x = block(x, y, t0)
 
-        # 6. Final layer
+        # 6. Final layer (squeeze 제거)
         t_final = t0[:, :2*D].reshape(B, 2, D)
         x = self.final_layer(x, t_final)
 
@@ -911,9 +930,16 @@ class ReferencePixArt(nn.Module):
         else:
             y = y.squeeze(1).view(1, -1, D)
 
-        for block in self.blocks:
-            x = block(x, y, t0)
+        # Transformer blocks (수정됨)
+        if self.gradient_checkpointing and self.training:
+            from torch.utils.checkpoint import checkpoint
+            for block in self.blocks:
+                x = checkpoint(block, x, y, t0, None, use_reentrant=False)
+        else:
+            for block in self.blocks:
+                x = block(x, y, t0)
 
+        # Final layer (squeeze 제거)
         t_final = t0[:, :2*D].reshape(B, 2, D)
         x = self.final_layer(x, t_final)
         x = self.unpatchify(x)

@@ -13,12 +13,12 @@ caption_type = 'blip2'  # or 'original'
 # ============================================
 # Model Settings
 # ============================================
-image_size = 512
+image_size = 256
 max_layers = 8
 model_max_length = 120
 
 # Pretrained paths
-pretrained_pixart = 'PixArt-alpha/PixArt-XL-2-512x512.pth'  # or HuggingFace id
+pretrained_pixart = 'PixArt-alpha/PixArt-XL-2-256x256.pth'  # or HuggingFace id
 vae_pretrained = '/workspace/twenty/PixArt-alpha/sd-vae-ft-ema'
 t5_pretrained = '/workspace/twenty/PixArt-alpha'
 
@@ -30,7 +30,7 @@ learn_sigma = True
 # Training Settings
 # ============================================
 num_epochs = 100
-train_batch_size = 1  # per GPU
+train_batch_size = 4  # per GPU
 gradient_accumulation_steps = 4  # effective batch = 4 * 4 * num_gpus
 
 # Diffusion
