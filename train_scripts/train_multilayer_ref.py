@@ -4,6 +4,12 @@ import os
 import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+os.environ['NCCL_TIMEOUT'] = '1800'  # 30분
+os.environ['NCCL_BLOCKING_WAIT'] = '1'
+os.environ['NCCL_ASYNC_ERROR_HANDLING'] = '1'
+os.environ['NCCL_DEBUG'] = 'WARN'  # 디버깅용
+
+
 import time
 import types
 import warnings
@@ -331,16 +337,42 @@ if __name__ == '__main__':
     even_batches = True
     if config.multi_scale:
         even_batches = False
+    
+    # accelerator = Accelerator(
+    #     mixed_precision=config.mixed_precision,
+    #     gradient_accumulation_steps=config.gradient_accumulation_steps,
+    #     log_with=args.report_to,
+    #     project_dir=os.path.join(config.work_dir, "logs"),
+    #     fsdp_plugin=fsdp_plugin,
+    #     even_batches=even_batches,
+    #     kwargs_handlers=[init_handler]
+    # )
+    from torch.nn.parallel import DistributedDataParallel as DDP
+    from accelerate import Accelerator, InitProcessGroupKwargs, DistributedDataParallelKwargs
+
+    # kwargs_handlers 수정
+    init_handler = InitProcessGroupKwargs()
+    init_handler.timeout = datetime.timedelta(seconds=7200)  # 2시간으로 증가
+
+    # DDP kwargs 추가
+    ddp_kwargs = DistributedDataParallelKwargs(
+        find_unused_parameters=False,
+        broadcast_buffers=False,  # 중요!
+        bucket_cap_mb=25,  # 기본값 25MB
+        gradient_as_bucket_view=True
+    )
 
     accelerator = Accelerator(
-        mixed_precision=config.mixed_precision,
-        gradient_accumulation_steps=config.gradient_accumulation_steps,
+        mixed_precision='no',  # 일단 비활성화
+        gradient_accumulation_steps=1,
         log_with=args.report_to,
         project_dir=os.path.join(config.work_dir, "logs"),
-        fsdp_plugin=fsdp_plugin,
-        even_batches=even_batches,
-        kwargs_handlers=[init_handler]
+        fsdp_plugin=None,
+        even_batches=True,
+        dispatch_batches=False,
+        kwargs_handlers=[init_handler, ddp_kwargs]  # ddp_kwargs 추가
     )
+
 
     logger = get_root_logger(os.path.join(config.work_dir, 'train_log.log'))
 
@@ -391,7 +423,6 @@ if __name__ == '__main__':
         model_max_length=config.model_max_length,
         pred_sigma=pred_sigma,
     ).train()
-
     model.enable_gradient_checkpointing()
 
     logger.info(f"Model: {model.__class__.__name__}")
@@ -424,10 +455,10 @@ if __name__ == '__main__':
     if len(missing_keys) > 0 and len(missing_keys) <= 20:
         logger.info(f"Missing keys: {missing_keys}")
 
+
     # Create EMA model
     model_ema = deepcopy(model).eval()
     ema_update(model_ema, model, 0.)
-    print_gpu_memory("After model load")
 
     # ============================================
     # Load Additional Checkpoint (optional)
@@ -446,10 +477,11 @@ if __name__ == '__main__':
     # Load VAE
     # ============================================
     logger.info(f"Loading VAE from: {config.vae_pretrained}")
-    vae = AutoencoderKL.from_pretrained(config.vae_pretrained).cuda().eval()
+    #vae = AutoencoderKL.from_pretrained(config.vae_pretrained).cuda().eval()
+    vae = AutoencoderKL.from_pretrained(config.vae_pretrained).to(accelerator.device).eval()
+
     for param in vae.parameters():
         param.requires_grad = False
-    print_gpu_memory("After vae load")
 
     # ============================================
     # Load T5 Text Encoder
@@ -457,8 +489,8 @@ if __name__ == '__main__':
     t5_pretrained = getattr(config, 't5_pretrained', 'google/flan-t5-xxl')
     logger.info(f"Loading T5 from: {t5_pretrained}")
 
-    text_encoder = T5Embedder(device="cuda", local_cache=True, cache_dir=t5_pretrained, torch_dtype=torch.float16)
-    print_gpu_memory("After t5 load")
+    #text_encoder = T5Embedder(device="cuda", local_cache=True, cache_dir=t5_pretrained, torch_dtype=torch.float16)
+    text_encoder = T5Embedder(device=accelerator.device, local_cache=True, cache_dir=t5_pretrained, torch_dtype=torch.float16)
 
     # ============================================
     # Prepare for FSDP
@@ -466,6 +498,20 @@ if __name__ == '__main__':
     if accelerator.distributed_type == DistributedType.FSDP:
         for m in accelerator._models:
             m.clip_grad_norm_ = types.MethodType(clip_grad_norm_, m)
+
+    # ============================================
+    # Build Optimizer
+    # ============================================
+    lr_scale_ratio = 1
+    if config.get('auto_lr', None):
+        lr_scale_ratio = auto_scale_lr(
+            config.train_batch_size * get_world_size() * config.gradient_accumulation_steps,
+            config.optimizer,
+            **config.auto_lr
+        )
+    
+    optimizer = build_optimizer(model, config.optimizer)
+
 
     # ============================================
     # Build Dataloader
@@ -487,17 +533,8 @@ if __name__ == '__main__':
     logger.info(f"Dataloader batches: {len(train_dataloader)}")
 
     # ============================================
-    # Build Optimizer and LR Scheduler
+    # Build LR Scheduler
     # ============================================
-    lr_scale_ratio = 1
-    if config.get('auto_lr', None):
-        lr_scale_ratio = auto_scale_lr(
-            config.train_batch_size * get_world_size() * config.gradient_accumulation_steps,
-            config.optimizer,
-            **config.auto_lr
-        )
-    
-    optimizer = build_optimizer(model, config.optimizer)
     lr_scheduler = build_lr_scheduler(config, optimizer, train_dataloader, lr_scale_ratio)
 
     # ============================================
@@ -515,13 +552,67 @@ if __name__ == '__main__':
         logger.warning(f'Missing keys: {missing}')
         logger.warning(f'Unexpected keys: {unexpected}')
 
+
+
+    logger.info("Checkpoint 2: Before accelerator.prepare()")
+    
+    if torch.distributed.is_initialized():
+        rank = torch.distributed.get_rank()
+        world_size = torch.distributed.get_world_size()
+        print(f"[RANK {rank}] About to prepare model", flush=True)
+        logger.info(f"Rank {rank}/{world_size}: About to prepare")
+
+    # rank 정보 출력
+    if torch.distributed.is_initialized():
+        rank = torch.distributed.get_rank()
+        world_size = torch.distributed.get_world_size()
+        logger.info(f"Rank {rank}/{world_size}: About to prepare")
+    
+    # ============================================
+    # Accelerator Prepare - 순차적으로 테스트
+    # ============================================
+
+    
+    print(f"[RANK {torch.distributed.get_rank() if torch.distributed.is_initialized() else 0}] Step 1: Preparing model...", flush=True)
+    logger.info("Step 1: Preparing model...")
+    model = accelerator.prepare(model)
+    print(f"[RANK {torch.distributed.get_rank() if torch.distributed.is_initialized() else 0}] Step 1 Done", flush=True)
+    logger.info("Step 1 Done")
+        
+    logger.info("Step 2: Preparing model_ema...")
+    model_ema = accelerator.prepare(model_ema)
+    logger.info("Step 2 Done")
+    
+    logger.info("Step 3: Preparing optimizer...")
+    optimizer = accelerator.prepare(optimizer)
+    logger.info("Step 3 Done")
+
+    logger.info("Step 4: Preparing lr_scheduler...")
+    lr_scheduler = accelerator.prepare(lr_scheduler)
+    logger.info("Step 4 Done")
+    
+    logger.info("Step 5: Preparing train_dataloader... (THIS MIGHT HANG)")
+    train_dataloader = accelerator.prepare(train_dataloader)
+    logger.info("Step 5 Done")
+    
+    logger.info("Checkpoint 3: After accelerator.prepare()")
+
+
+
+
+    if torch.distributed.is_initialized():
+        torch.distributed.barrier()
+    logger.info(f"Rank {torch.distributed.get_rank()}: Passed barrier")
+
     # ============================================
     # Accelerator Prepare
     # ============================================
     model, model_ema = accelerator.prepare(model, model_ema)
+    print(2.5)
     optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
         optimizer, train_dataloader, lr_scheduler
     )
+    print(3)
     # ============================================
     # Initialize Tracker
     # ============================================
@@ -532,7 +623,6 @@ if __name__ == '__main__':
             accelerator.init_trackers(args.tracker_project_name, tracker_config)
         except:
             accelerator.init_trackers(f"tb_{timestamp}")
-
     # ============================================
     # Start Training
     # ============================================

@@ -30,7 +30,7 @@ learn_sigma = True
 # Training Settings
 # ============================================
 num_epochs = 100
-train_batch_size = 1  # per GPU
+train_batch_size = 4  # per GPU
 gradient_accumulation_steps = 4  # effective batch = 4 * 4 * num_gpus
 
 # Diffusion

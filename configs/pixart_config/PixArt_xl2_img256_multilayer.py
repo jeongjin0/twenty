@@ -31,7 +31,7 @@ learn_sigma = True
 # ============================================
 num_epochs = 100
 train_batch_size = 4  # per GPU
-gradient_accumulation_steps = 4  # effective batch = 4 * 4 * num_gpus
+gradient_accumulation_steps = 1  # effective batch = 4 * 4 * num_gpus
 
 # Diffusion
 train_sampling_steps = 1000
@@ -71,7 +71,8 @@ save_model_steps = 5000
 # Distributed Training
 # ============================================
 use_fsdp = False
-mixed_precision = 'fp16'  # or 'bf16' for A100
+#mixed_precision = 'fp16'  # or 'bf16' for A100
+mixed_predcision = 'no'
 multi_scale = False
 num_workers = 4
 
