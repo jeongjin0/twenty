@@ -4,12 +4,6 @@ import os
 import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-os.environ['NCCL_TIMEOUT'] = '1800'  # 30분
-os.environ['NCCL_BLOCKING_WAIT'] = '1'
-os.environ['NCCL_ASYNC_ERROR_HANDLING'] = '1'
-os.environ['NCCL_DEBUG'] = 'WARN'  # 디버깅용
-
-
 import time
 import types
 import warnings
@@ -19,8 +13,10 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from accelerate import Accelerator, InitProcessGroupKwargs
+from accelerate import Accelerator, InitProcessGroupKwargs, DistributedDataParallelKwargs
 from accelerate.utils import DistributedType
+
+
 from diffusers.models import AutoencoderKL
 from mmcv.runner import LogBuffer
 from torch.utils.data import RandomSampler
@@ -36,7 +32,7 @@ from diffusion.utils.logger import get_root_logger
 from diffusion.utils.lr_scheduler import build_lr_scheduler
 from diffusion.utils.misc import set_random_seed, read_config, init_random_seed, DebugUnderflowOverflow
 from diffusion.utils.optimizer import build_optimizer, auto_scale_lr
-
+from accelerate import Accelerator, InitProcessGroupKwargs, DistributedDataParallelKwargs
 warnings.filterwarnings("ignore")  # ignore warning
 
 current_file_path = Path(__file__).resolve()
@@ -57,48 +53,33 @@ def reset_memory_stats():
     torch.cuda.empty_cache()
 
 
-def encode_reference_vae(vae, layers, num_layers, target_idx=0, scale_factor=0.18215):
-    """
-    타겟 레이어와 참조 레이어 분리 인코딩.
-    
-    Args:
-        layers: (B, N, 4, H, W) - 전체 레이어
-        num_layers: (B,) - 유효 레이어 수
-        target_idx: 타겟으로 사용할 레이어 인덱스 (0=맨 아래)
-    
-    Returns:
-        z_target: (B, 4, h, w) - 타겟 latent
-        z_ref: (B, N-1, 4, h, w) - 참조 latents
-        ref_mask: (B, N-1) - 유효 참조 마스크
-    """
+def encode_reference_vae_rgba(vae, layers, num_layers, target_idx=0, scale_factor=0.18215):
+    """Alpha를 포함한 VAE 인코딩"""
     B, N, C, H, W = layers.shape
     
-    # RGB만 추출
-    rgb = layers[:, :, :3, :, :]  # (B, N, 3, H, W)
-    
-    # VAE 인코딩
+    # RGB: VAE 인코딩
+    rgb = layers[:, :, :3, :, :]
     rgb_flat = rgb.reshape(B * N, 3, H, W)
-    with torch.no_grad():
-        z_flat = vae.encode(rgb_flat).latent_dist.mode() * scale_factor
+    z_rgb_flat = vae.encode(rgb_flat).latent_dist.mode() * scale_factor
     
-    _, C_latent, h, w = z_flat.shape
-    z_all = z_flat.reshape(B, N, C_latent, h, w)
+    _, C_latent, h, w = z_rgb_flat.shape
+    z_rgb = z_rgb_flat.reshape(B, N, C_latent, h, w)
+    
+    # Alpha: 단순 다운샘플링 (VAE 거치지 않음)
+    alpha = layers[:, :, 3:4, :, :]  # (B, N, 1, H, W)
+    alpha_flat = alpha.reshape(B * N, 1, H, W)
+    alpha_down = F.interpolate(alpha_flat, size=(h, w), mode='bilinear', align_corners=False)
+    alpha_down = alpha_down.reshape(B, N, 1, h, w)
+    
+    # RGB latent (4ch) + Alpha (1ch) = 5채널
+    z_all = torch.cat([z_rgb, alpha_down], dim=2)  # (B, N, 5, h, w)
     
     # 타겟/참조 분리
-    z_target = z_all[:, target_idx]  # (B, 4, h, w)
-    
-    # 참조: 타겟 제외한 나머지
+    z_target = z_all[:, target_idx]  # (B, 5, h, w)
     ref_indices = [i for i in range(N) if i != target_idx]
-    z_ref = z_all[:, ref_indices]  # (B, N-1, 4, h, w)
+    z_ref = z_all[:, ref_indices]    # (B, N-1, 5, h, w)
     
-    # 참조 마스크 생성
-    ref_mask = torch.zeros(B, N - 1, device=layers.device)
-    for i in range(B):
-        valid_refs = min(num_layers[i].item() - 1, N - 1)  # 타겟 제외
-        ref_mask[i, :valid_refs] = 1.0
-    
-    return z_target, z_ref, ref_mask
-
+    return z_target, z_ref, _
 
 def set_fsdp_env():
     os.environ["ACCELERATE_USE_FSDP"] = 'true'
@@ -146,12 +127,12 @@ def train():
                 # 랜덤하게 타겟 레이어 선택 (또는 고정)
                 target_idx = torch.randint(0, layers.shape[1], (1,)).item()
                 
-                z_target, z_ref, ref_mask = encode_reference_vae(
+                z_target, z_ref, ref_mask = encode_reference_vae_rgba(
                     vae, layers, num_layers,
                     target_idx=target_idx,
                     scale_factor=config.scale_factor
                 )
-            
+
             # 3. T5 encoding
             with torch.no_grad():
                 caption_embs, emb_masks = text_encoder.get_text_embeddings(captions)
@@ -322,6 +303,11 @@ if __name__ == '__main__':
     init_handler = InitProcessGroupKwargs()
     init_handler.timeout = datetime.timedelta(seconds=5400)
     
+    ddp_kwargs = DistributedDataParallelKwargs(
+        broadcast_buffers=False,
+        gradient_as_bucket_view=False  # 명시적으로 False
+    )
+
     if config.use_fsdp:
         init_train = 'FSDP'
         from accelerate import FullyShardedDataParallelPlugin
@@ -337,42 +323,16 @@ if __name__ == '__main__':
     even_batches = True
     if config.multi_scale:
         even_batches = False
-    
-    # accelerator = Accelerator(
-    #     mixed_precision=config.mixed_precision,
-    #     gradient_accumulation_steps=config.gradient_accumulation_steps,
-    #     log_with=args.report_to,
-    #     project_dir=os.path.join(config.work_dir, "logs"),
-    #     fsdp_plugin=fsdp_plugin,
-    #     even_batches=even_batches,
-    #     kwargs_handlers=[init_handler]
-    # )
-    from torch.nn.parallel import DistributedDataParallel as DDP
-    from accelerate import Accelerator, InitProcessGroupKwargs, DistributedDataParallelKwargs
-
-    # kwargs_handlers 수정
-    init_handler = InitProcessGroupKwargs()
-    init_handler.timeout = datetime.timedelta(seconds=7200)  # 2시간으로 증가
-
-    # DDP kwargs 추가
-    ddp_kwargs = DistributedDataParallelKwargs(
-        find_unused_parameters=False,
-        broadcast_buffers=False,  # 중요!
-        bucket_cap_mb=25,  # 기본값 25MB
-        gradient_as_bucket_view=True
-    )
 
     accelerator = Accelerator(
-        mixed_precision='no',  # 일단 비활성화
-        gradient_accumulation_steps=1,
+        mixed_precision=config.mixed_precision,
+        gradient_accumulation_steps=config.gradient_accumulation_steps,
         log_with=args.report_to,
         project_dir=os.path.join(config.work_dir, "logs"),
-        fsdp_plugin=None,
-        even_batches=True,
-        dispatch_batches=False,
-        kwargs_handlers=[init_handler, ddp_kwargs]  # ddp_kwargs 추가
+        fsdp_plugin=fsdp_plugin,
+        even_batches=even_batches,
+        kwargs_handlers=[init_handler, ddp_kwargs]
     )
-
 
     logger = get_root_logger(os.path.join(config.work_dir, 'train_log.log'))
 
@@ -416,49 +376,227 @@ if __name__ == '__main__':
     from diffusion.model.nets.PixArt_multilayer import ReferencePixArt_XL_2
     model = ReferencePixArt_XL_2(
         input_size=latent_size,
-        in_channels=4,
+        in_channels=5,
         max_ref_layers=max_layers - 1,  # 타겟 제외
         ref_encoder_depth=4,
         caption_channels=4096,
         model_max_length=config.model_max_length,
         pred_sigma=pred_sigma,
     ).train()
+
+
+    model_type = 'adaln'
+    logger.info(f"Building MultiLayerPixArt model of type: {model_type}")
+
+    if model_type == 'adaln':
+        from diffusion.model.nets.PixArt_multilayer import ReferencePixArt_XL_2
+        model = ReferencePixArt_XL_2(
+            input_size=latent_size,
+            in_channels=5,
+            max_ref_layers=max_layers - 1,
+            ref_encoder_depth=4,
+            caption_channels=4096,
+            model_max_length=config.model_max_length,
+            pred_sigma=pred_sigma,
+        ).train()
+    elif model_type == 'crossattn':
+        from diffusion.model.nets.PixArt_reference_crossattn import ReferencePixArtCrossAttn_XL_2
+        model = ReferencePixArtCrossAttn_XL_2(
+            input_size=latent_size,\
+            in_channels=5,
+            max_ref_layers=max_layers - 1,
+            ref_encoder_depth=4,
+            ref_compression_ratio=4, 
+            caption_channels=4096,
+            model_max_length=config.model_max_length,
+            pred_sigma=pred_sigma,
+        ).train()
+
+
     model.enable_gradient_checkpointing()
 
     logger.info(f"Model: {model.__class__.__name__}")
     logger.info(f"Model Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
+
+
+
+    print("\n" + "="*60)
+    print("Model Architecture Diagnosis:")
+    print("="*60)
+
+    # x_embedder 확인
+    print(f"\n[x_embedder]")
+    print(f"  weight shape: {model.x_embedder.proj.weight.shape}")
+    print(f"  → Input channels: {model.x_embedder.proj.weight.shape[1]}")
+
+    # final_layer 확인
+    print(f"\n[final_layer]")
+    print(f"  linear weight shape: {model.final_layer.linear.weight.shape}")
+    out_features = model.final_layer.linear.weight.shape[0]
+    patch_size = model.patch_size
+    out_channels = out_features // (patch_size * patch_size)
+    print(f"  → Output channels: {out_channels} (patch_size={patch_size})")
+
+    # y_embedder 확인
+    print(f"\n[y_embedder]")
+    print(f"  y_proj[0] (Linear) weight shape: {model.y_embedder.y_proj[0].weight.shape}")
+    print(f"  y_proj[2] (Linear) weight shape: {model.y_embedder.y_proj[2].weight.shape}")
+
+    # Reference encoder 확인
+    if hasattr(model, 'ref_encoder'):
+        print(f"\n[ref_encoder]")
+        print(f"  Has reference encoder: True")
+        ref_params = sum(p.numel() for p in model.ref_encoder.parameters())
+        print(f"  Parameters: {ref_params:,}")
+        print(f"  patch_embed weight shape: {model.ref_encoder.patch_embed.proj.weight.shape}")
+        print(f"  → Input channels: {model.ref_encoder.patch_embed.proj.weight.shape[1]}")
+    else:
+        print(f"\n[ref_encoder]")
+        print(f"  Has reference encoder: False")
+
+    print("="*60 + "\n")
+
+
+
+
+
     # ============================================
     # Load Pretrained PixArt Weights
     # ============================================
-    pretrained_path = getattr(config, 'pretrained_pixart', 'PixArt-alpha/PixArt-XL-2-512x512.pth')
-    logger.info(f"Loading pretrained weights from: {pretrained_path}")
-    
-    if pretrained_path.endswith('.pth'):
-        checkpoint = torch.load(pretrained_path, map_location='cpu')
-        if 'state_dict' in checkpoint:
+    # pretrained_path = getattr(config, 'pretrained_pixart', None)
+
+    # if pretrained_path is not None:
+    #     logger.info(f"Loading pretrained weights from: {pretrained_path}")
+
+    #     if pretrained_path.endswith('.pth'):
+    #         checkpoint = torch.load(pretrained_path, map_location='cpu')
+    #         pretrained_state_dict = checkpoint['state_dict']
+            
+    #         # Position embedding resize
+    #         if 'pos_embed' in pretrained_state_dict:
+    #             old_pos_embed = pretrained_state_dict['pos_embed']
+    #             new_size = model.pos_embed.shape[1]
+    #             old_size = old_pos_embed.shape[1]
+                
+    #             if old_size != new_size:
+    #                 print(f"Resizing pos_embed: {old_size} -> {new_size}")
+    #                 pretrained_state_dict['pos_embed'] = F.interpolate(
+    #                     old_pos_embed.reshape(1, int(old_size**0.5), int(old_size**0.5), -1).permute(0,3,1,2),
+    #                     size=(int(new_size**0.5), int(new_size**0.5)),
+    #                     mode='bilinear'
+    #                 ).permute(0,2,3,1).reshape(1, new_size, -1)
+    #     else:
+    #         raise ValueError("Unsupported pretrained format. Use .pth files.")
+
+    #     missing_keys = model.load_pretrained_pixart(pretrained_state_dict)
+    #     logger.info(f"Loaded pretrained. Missing keys (new layers): {len(missing_keys)}")
+    #     if len(missing_keys) > 0 and len(missing_keys) <= 20:
+    #         logger.info(f"Missing keys: {missing_keys}")
+    # else:
+    #     logger.info("Training from scratch.")
+
+
+
+    pretrained_path = getattr(config, 'pretrained_pixart', None)
+
+    if pretrained_path is not None:
+        logger.info(f"Loading pretrained weights from: {pretrained_path}")
+
+        if pretrained_path.endswith('.pth'):
+            checkpoint = torch.load(pretrained_path, map_location='cpu')
             pretrained_state_dict = checkpoint['state_dict']
-        elif 'model' in checkpoint:
-            pretrained_state_dict = checkpoint['model']
+            
+            # ============================================================
+            # 1. x_embedder adaptation (기존)
+            # ============================================================
+            if 'x_embedder.proj.weight' in pretrained_state_dict:
+                pretrained_weight = pretrained_state_dict['x_embedder.proj.weight']
+                model_weight = model.x_embedder.proj.weight
+                
+                if pretrained_weight.shape[1] != model_weight.shape[1]:
+                    logger.info(f"Adapting x_embedder: {pretrained_weight.shape[1]}ch -> {model_weight.shape[1]}ch")
+                    
+                    new_weight = torch.zeros_like(model_weight)
+                    # RGB 복사
+                    new_weight[:, :4, :, :] = pretrained_weight[:, :4, :, :]
+                    # Alpha를 RGB 평균으로 (논문 방식)
+                    rgb_mean = pretrained_weight[:, :3, :, :].mean(dim=1, keepdim=True)
+                    new_weight[:, 4:5, :, :] = rgb_mean * 0.1  # 작게!
+                    
+                    pretrained_state_dict['x_embedder.proj.weight'] = new_weight
+                    logger.info(f"  ✓ x_embedder adapted (alpha = RGB mean × 0.1)")
+            
+            # ============================================================
+            # 2. final_layer adaptation (새로 추가!) ⭐
+            # ============================================================
+            if 'final_layer.linear.weight' in pretrained_state_dict:
+                pretrained_weight = pretrained_state_dict['final_layer.linear.weight']
+                model_weight = model.final_layer.linear.weight
+                
+                if pretrained_weight.shape[0] != model_weight.shape[0]:
+                    logger.info(f"Adapting final_layer: {pretrained_weight.shape[0]} -> {model_weight.shape[0]} out_features")
+                    
+                    patch_size = model.patch_size
+                    old_channels = pretrained_weight.shape[0] // (patch_size * patch_size)
+                    new_channels = model_weight.shape[0] // (patch_size * patch_size)
+                    
+                    logger.info(f"  Output channels: {old_channels} -> {new_channels}")
+                    
+                    # Reshape: (out_features, hidden) -> (patch^2, channels, hidden)
+                    pre_w = pretrained_weight.reshape(patch_size * patch_size, old_channels, -1)
+                    new_w = torch.zeros(patch_size * patch_size, new_channels, pre_w.shape[-1])
+                    
+                    # RGB/RGBA 복사
+                    copy_ch = min(old_channels, new_channels, 4)
+                    new_w[:, :copy_ch, :] = pre_w[:, :copy_ch, :]
+                    
+                    # Alpha 채널 작게 초기화
+                    if new_channels > old_channels:
+                        torch.nn.init.normal_(new_w[:, old_channels:, :], std=0.0001)
+                    
+                    # Reshape back
+                    new_w = new_w.reshape(-1, pre_w.shape[-1])
+                    pretrained_state_dict['final_layer.linear.weight'] = new_w
+                    logger.info(f"  ✓ final_layer weight adapted")
+                    
+                    # Bias도 마찬가지
+                    if 'final_layer.linear.bias' in pretrained_state_dict:
+                        pre_b = pretrained_state_dict['final_layer.linear.bias']
+                        pre_b = pre_b.reshape(patch_size * patch_size, old_channels)
+                        new_b = torch.zeros(patch_size * patch_size, new_channels)
+                        new_b[:, :copy_ch] = pre_b[:, :copy_ch]
+                        new_b = new_b.reshape(-1)
+                        pretrained_state_dict['final_layer.linear.bias'] = new_b
+                        logger.info(f"  ✓ final_layer bias adapted")
+            
+            # Position embedding resize
+            if 'pos_embed' in pretrained_state_dict:
+                old_pos_embed = pretrained_state_dict['pos_embed']
+                new_size = model.pos_embed.shape[1]
+                old_size = old_pos_embed.shape[1]
+                
+                if old_size != new_size:
+                    logger.info(f"Resizing pos_embed: {old_size} -> {new_size}")
+                    pretrained_state_dict['pos_embed'] = F.interpolate(
+                        old_pos_embed.reshape(1, int(old_size**0.5), int(old_size**0.5), -1).permute(0,3,1,2),
+                        size=(int(new_size**0.5), int(new_size**0.5)),
+                        mode='bilinear'
+                    ).permute(0,2,3,1).reshape(1, new_size, -1)
+                    logger.info(f"  ✓ pos_embed resized")
         else:
-            pretrained_state_dict = checkpoint
-    else:
-        # HuggingFace model
-        from diffusers import PixArtAlphaPipeline
-        pipe = PixArtAlphaPipeline.from_pretrained(pretrained_path, torch_dtype=torch.float32)
-        pretrained_state_dict = pipe.transformer.state_dict()
-        del pipe
-        torch.cuda.empty_cache()
-    
-    missing_keys = model.load_pretrained_pixart(pretrained_state_dict)
-    logger.info(f"Loaded pretrained. Missing keys (new layers): {len(missing_keys)}")
-    if len(missing_keys) > 0 and len(missing_keys) <= 20:
-        logger.info(f"Missing keys: {missing_keys}")
+            raise ValueError("Unsupported pretrained format.")
+
+        missing_keys = model.load_pretrained_pixart(pretrained_state_dict)
+        logger.info(f"Loaded pretrained. Missing keys: {len(missing_keys)}")
+        if len(missing_keys) > 0 and len(missing_keys) <= 20:
+            logger.info(f"Missing keys: {missing_keys}")
 
 
     # Create EMA model
     model_ema = deepcopy(model).eval()
     ema_update(model_ema, model, 0.)
+    print_gpu_memory("After model load")
 
     # ============================================
     # Load Additional Checkpoint (optional)
@@ -477,11 +615,10 @@ if __name__ == '__main__':
     # Load VAE
     # ============================================
     logger.info(f"Loading VAE from: {config.vae_pretrained}")
-    #vae = AutoencoderKL.from_pretrained(config.vae_pretrained).cuda().eval()
     vae = AutoencoderKL.from_pretrained(config.vae_pretrained).to(accelerator.device).eval()
-
     for param in vae.parameters():
         param.requires_grad = False
+    print_gpu_memory("After vae load")
 
     # ============================================
     # Load T5 Text Encoder
@@ -489,8 +626,8 @@ if __name__ == '__main__':
     t5_pretrained = getattr(config, 't5_pretrained', 'google/flan-t5-xxl')
     logger.info(f"Loading T5 from: {t5_pretrained}")
 
-    #text_encoder = T5Embedder(device="cuda", local_cache=True, cache_dir=t5_pretrained, torch_dtype=torch.float16)
     text_encoder = T5Embedder(device=accelerator.device, local_cache=True, cache_dir=t5_pretrained, torch_dtype=torch.float16)
+    print_gpu_memory("After t5 load")
 
     # ============================================
     # Prepare for FSDP
@@ -498,20 +635,6 @@ if __name__ == '__main__':
     if accelerator.distributed_type == DistributedType.FSDP:
         for m in accelerator._models:
             m.clip_grad_norm_ = types.MethodType(clip_grad_norm_, m)
-
-    # ============================================
-    # Build Optimizer
-    # ============================================
-    lr_scale_ratio = 1
-    if config.get('auto_lr', None):
-        lr_scale_ratio = auto_scale_lr(
-            config.train_batch_size * get_world_size() * config.gradient_accumulation_steps,
-            config.optimizer,
-            **config.auto_lr
-        )
-    
-    optimizer = build_optimizer(model, config.optimizer)
-
 
     # ============================================
     # Build Dataloader
@@ -533,8 +656,18 @@ if __name__ == '__main__':
     logger.info(f"Dataloader batches: {len(train_dataloader)}")
 
     # ============================================
-    # Build LR Scheduler
+    # Build Optimizer and LR Scheduler
     # ============================================
+    lr_scale_ratio = 1
+    if config.get('auto_lr', None):
+        lr_scale_ratio = auto_scale_lr(
+            config.train_batch_size * get_world_size() * config.gradient_accumulation_steps,
+            config.optimizer,
+            **config.auto_lr
+        )
+        logger.info(f"Auto scaling lr by ratio: {lr_scale_ratio:.2f}")
+    
+    optimizer = build_optimizer(model, config.optimizer)
     lr_scheduler = build_lr_scheduler(config, optimizer, train_dataloader, lr_scale_ratio)
 
     # ============================================
@@ -552,67 +685,15 @@ if __name__ == '__main__':
         logger.warning(f'Missing keys: {missing}')
         logger.warning(f'Unexpected keys: {unexpected}')
 
-
-
-    logger.info("Checkpoint 2: Before accelerator.prepare()")
-    
-    if torch.distributed.is_initialized():
-        rank = torch.distributed.get_rank()
-        world_size = torch.distributed.get_world_size()
-        print(f"[RANK {rank}] About to prepare model", flush=True)
-        logger.info(f"Rank {rank}/{world_size}: About to prepare")
-
-    # rank 정보 출력
-    if torch.distributed.is_initialized():
-        rank = torch.distributed.get_rank()
-        world_size = torch.distributed.get_world_size()
-        logger.info(f"Rank {rank}/{world_size}: About to prepare")
-    
-    # ============================================
-    # Accelerator Prepare - 순차적으로 테스트
-    # ============================================
-
-    
-    print(f"[RANK {torch.distributed.get_rank() if torch.distributed.is_initialized() else 0}] Step 1: Preparing model...", flush=True)
-    logger.info("Step 1: Preparing model...")
-    model = accelerator.prepare(model)
-    print(f"[RANK {torch.distributed.get_rank() if torch.distributed.is_initialized() else 0}] Step 1 Done", flush=True)
-    logger.info("Step 1 Done")
-        
-    logger.info("Step 2: Preparing model_ema...")
-    model_ema = accelerator.prepare(model_ema)
-    logger.info("Step 2 Done")
-    
-    logger.info("Step 3: Preparing optimizer...")
-    optimizer = accelerator.prepare(optimizer)
-    logger.info("Step 3 Done")
-
-    logger.info("Step 4: Preparing lr_scheduler...")
-    lr_scheduler = accelerator.prepare(lr_scheduler)
-    logger.info("Step 4 Done")
-    
-    logger.info("Step 5: Preparing train_dataloader... (THIS MIGHT HANG)")
-    train_dataloader = accelerator.prepare(train_dataloader)
-    logger.info("Step 5 Done")
-    
-    logger.info("Checkpoint 3: After accelerator.prepare()")
-
-
-
-
-    if torch.distributed.is_initialized():
-        torch.distributed.barrier()
-    logger.info(f"Rank {torch.distributed.get_rank()}: Passed barrier")
-
     # ============================================
     # Accelerator Prepare
     # ============================================
     model, model_ema = accelerator.prepare(model, model_ema)
-    print(2.5)
     optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
         optimizer, train_dataloader, lr_scheduler
     )
-    print(3)
+
+
     # ============================================
     # Initialize Tracker
     # ============================================
@@ -623,6 +704,7 @@ if __name__ == '__main__':
             accelerator.init_trackers(args.tracker_project_name, tracker_config)
         except:
             accelerator.init_trackers(f"tb_{timestamp}")
+
     # ============================================
     # Start Training
     # ============================================
