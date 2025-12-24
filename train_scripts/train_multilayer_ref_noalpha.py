@@ -587,8 +587,10 @@ if __name__ == '__main__':
     # Build MultiLayerPixArt Model
     # ============================================
 
-
-    model_type = 'adaln'
+    # Use 'crossattn' for better prompt alignment
+    # - crossattn: Text and reference both use cross-attention (balanced, preserves text-to-image ability)
+    # - adaln: Reference uses AdaLN, text uses cross-attention (reference can dominate)
+    model_type = 'crossattn'
     logger.info(f"Building MultiLayerPixArt model of type: {model_type}")
 
     if model_type == 'adaln':
