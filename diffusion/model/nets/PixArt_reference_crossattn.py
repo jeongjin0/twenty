@@ -1,10 +1,13 @@
-# Multi-Layer Text-to-Image Architectures based on PixArt
-# Architecture 1: MultiLayerPixArt - All layers simultaneous generation with text conditioning
-# Architecture 2: ReferencePixArt - Single layer generation with reference + text conditioning
+# ReferencePixArt with Cross-Attention Reference Injection
+# 
+# 두 가지 Reference 주입 방식:
+# 1. AdaLN 방식 (기존): ref_emb를 timestep에 더해서 adaLN으로 주입
+# 2. Cross-Attention 방식 (새로운): ref_tokens를 text와 concat해서 cross-attention
 #
-# References:
-# PixArt-α: https://github.com/PixArt-alpha/PixArt-alpha
-# DiT: https://github.com/facebookresearch/DiT
+# Cross-Attention 장점:
+# - 더 풍부한 공간적 상호작용
+# - Reference의 세부 정보 더 잘 전달
+# - Attention map으로 어디를 참조하는지 시각화 가능
 
 import math
 import torch
@@ -14,7 +17,7 @@ import numpy as np
 from timm.models.layers import DropPath
 from timm.models.vision_transformer import PatchEmbed, Mlp
 from typing import Optional, List, Tuple
-from diffusion.model.nets.PixArt_blocks import T2IFinalLayer
+
 
 #################################################################################
 #                              Utility Functions                                #
@@ -22,6 +25,7 @@ from diffusion.model.nets.PixArt_blocks import T2IFinalLayer
 
 def t2i_modulate(x, shift, scale):
     return x * (1 + scale) + shift
+
 
 def get_2d_sincos_pos_embed(embed_dim, grid_size, cls_token=False, extra_tokens=0, lewei_scale=1.0, base_size=16):
     if isinstance(grid_size, int):
@@ -61,7 +65,6 @@ def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
 #################################################################################
 
 class TimestepEmbedder(nn.Module):
-    """Embeds scalar timesteps into vector representations."""
     def __init__(self, hidden_size, frequency_embedding_size=256):
         super().__init__()
         self.mlp = nn.Sequential(
@@ -90,22 +93,17 @@ class TimestepEmbedder(nn.Module):
 
 
 class CaptionEmbedder(nn.Module):
-    """
-    Embeds text captions into vector representations.
-    Also handles unconditional embedding for classifier-free guidance.
-    """
     def __init__(self, in_channels, hidden_size, uncond_prob, act_layer=nn.GELU, token_num=120):
         super().__init__()
-        self.y_proj = nn.Module()
-        self.y_proj.fc1 = nn.Linear(in_channels, hidden_size, bias=True)
-        self.y_proj.act = act_layer()
-        self.y_proj.fc2 = nn.Linear(hidden_size, hidden_size, bias=True)
-        
+        self.y_proj = nn.Sequential(
+            nn.Linear(in_channels, hidden_size, bias=True),
+            act_layer(),
+            nn.Linear(hidden_size, hidden_size, bias=True),
+        )
         self.register_buffer("y_embedding", nn.Parameter(torch.randn(token_num, in_channels) / in_channels ** 0.5))
         self.uncond_prob = uncond_prob
 
     def token_drop(self, caption, force_drop_ids=None):
-        """Drops captions to enable classifier-free guidance."""
         if force_drop_ids is None:
             drop_ids = torch.rand(caption.shape[0], device=caption.device) < self.uncond_prob
         else:
@@ -116,14 +114,11 @@ class CaptionEmbedder(nn.Module):
     def forward(self, caption, train, force_drop_ids=None):
         if train:
             caption = self.token_drop(caption, force_drop_ids)
-        caption = self.y_proj.fc1(caption)
-        caption = self.y_proj.act(caption)
-        caption = self.y_proj.fc2(caption)
+        caption = self.y_proj(caption)
         return caption
 
 
 class MultiHeadCrossAttention(nn.Module):
-    """Multi-head cross attention for text conditioning."""
     def __init__(self, d_model, num_heads, attn_drop=0., proj_drop=0., **kwargs):
         super().__init__()
         self.num_heads = num_heads
@@ -137,24 +132,16 @@ class MultiHeadCrossAttention(nn.Module):
         self.proj_drop = nn.Dropout(proj_drop)
 
     def forward(self, x, cond, mask=None):
-        """
-        x: (B, N, C) - image tokens
-        cond: (1, L_total, C) or (B, L, C) - text tokens (packed or batched)
-        mask: optional attention mask
-        """
         B, N, C = x.shape
 
         q = self.q_linear(x).reshape(B, N, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
 
-        # Handle packed text tokens
         if cond.shape[0] == 1 and B > 1:
-            # Packed format: (1, L_total, C)
             kv = self.kv_linear(cond).reshape(1, -1, 2, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
-            k, v = kv[0], kv[1]  # (1, num_heads, L_total, head_dim)
+            k, v = kv[0], kv[1]
             k = k.expand(B, -1, -1, -1)
             v = v.expand(B, -1, -1, -1)
         else:
-            # Batched format: (B, L, C)
             kv = self.kv_linear(cond).reshape(B, -1, 2, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
             k, v = kv[0], kv[1]
 
@@ -173,7 +160,6 @@ class MultiHeadCrossAttention(nn.Module):
 
 
 class WindowAttention(nn.Module):
-    """Self-attention with optional window attention."""
     def __init__(self, dim, num_heads, qkv_bias=True, attn_drop=0., proj_drop=0., 
                  input_size=None, use_rel_pos=False, **kwargs):
         super().__init__()
@@ -206,28 +192,21 @@ class WindowAttention(nn.Module):
         return x
 
 
-# class T2IFinalLayer(nn.Module):
-#     """Final layer for text-to-image models."""
-#     def __init__(self, hidden_size, patch_size, out_channels):
-#         super().__init__()
-#         self.norm_final = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-#         self.linear = nn.Linear(hidden_size, patch_size * patch_size * out_channels, bias=True)
-#         self.scale_shift_table = nn.Parameter(torch.randn(2, hidden_size) / hidden_size ** 0.5)
+class T2IFinalLayer(nn.Module):
+    def __init__(self, hidden_size, patch_size, out_channels):
+        super().__init__()
+        self.norm_final = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.linear = nn.Linear(hidden_size, patch_size * patch_size * out_channels, bias=True)
+        self.scale_shift_table = nn.Parameter(torch.randn(2, hidden_size) / hidden_size ** 0.5)
 
-#     def forward(self, x, t):
-#         shift, scale = (self.scale_shift_table[None] + t.reshape(-1, 2, x.shape[-1])).chunk(2, dim=1)
-#         x = t2i_modulate(self.norm_final(x), shift, scale)
-#         x = self.linear(x)
-#         return x
+    def forward(self, x, t):
+        shift, scale = (self.scale_shift_table[None] + t.reshape(-1, 2, x.shape[-1])).chunk(2, dim=1)
+        x = t2i_modulate(self.norm_final(x), shift, scale)
+        x = self.linear(x)
+        return x
 
-from diffusion.model.nets.PixArt_blocks import t2i_modulate, CaptionEmbedder, WindowAttention, MultiHeadCrossAttention, T2IFinalLayer, TimestepEmbedder, LabelEmbedder, FinalLayer
-
-#################################################################################
-#                              PixArt Block                                     #
-#################################################################################
 
 class PixArtBlock(nn.Module):
-    """A PixArt block with adaptive layer norm (adaLN-single) conditioning."""
     def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, drop_path=0., 
                  window_size=0, input_size=None, use_rel_pos=False, **block_kwargs):
         super().__init__()
@@ -262,15 +241,18 @@ class PixArtBlock(nn.Module):
         return x
 
 
-
 #################################################################################
-#       Architecture 2: ReferencePixArt - Reference-based Generation            #
+#                    Reference Encoder (Token-based for Cross-Attention)        #
 #################################################################################
 
-class ReferenceEncoder(nn.Module):
+class ReferenceTokenEncoder(nn.Module):
     """
-    Encodes multiple reference layers into conditioning embeddings.
-    Uses a lightweight transformer to aggregate reference information.
+    Reference 레이어들을 토큰 시퀀스로 인코딩.
+    Cross-attention에서 사용하기 위해 (B, N_tokens, D) 형태로 출력.
+    
+    vs ReferenceEncoder (기존):
+    - 기존: 모든 reference를 하나의 벡터로 압축 (B, D)
+    - 새로운: 토큰 시퀀스 유지 (B, N_ref * T_compressed, D)
     """
     def __init__(
         self,
@@ -282,22 +264,31 @@ class ReferenceEncoder(nn.Module):
         depth=4,
         mlp_ratio=4.0,
         max_layers=16,
+        compression_ratio=4,  # 공간 압축 비율 (T → T/ratio)
     ):
         super().__init__()
         self.hidden_size = hidden_size
         self.max_layers = max_layers
+        self.compression_ratio = compression_ratio
 
         # Patch embedding
         self.patch_embed = PatchEmbed(input_size, patch_size, in_channels, hidden_size, bias=True)
         num_patches = self.patch_embed.num_patches
         self.num_patches = num_patches
+        
+        # Compressed token count per layer
+        self.tokens_per_layer = num_patches // (compression_ratio ** 2)
 
         # Positional embeddings
         self.register_buffer("pos_embed", torch.zeros(1, num_patches, hidden_size))
         self.layer_embed = nn.Parameter(torch.zeros(1, max_layers, 1, hidden_size))
 
-        # Pool token
-        self.pool_token = nn.Parameter(torch.zeros(1, 1, hidden_size))
+        # Spatial compression (learnable pooling)
+        self.spatial_compress = nn.Sequential(
+            nn.Conv2d(hidden_size, hidden_size, kernel_size=compression_ratio, stride=compression_ratio),
+            nn.GELU(),
+            nn.Conv2d(hidden_size, hidden_size, kernel_size=1),
+        )
 
         # Transformer encoder
         approx_gelu = lambda: nn.GELU(approximate="tanh")
@@ -312,8 +303,11 @@ class ReferenceEncoder(nn.Module):
             for _ in range(depth)
         ])
 
-        # Output projection
+        # Output projection to match text embedding dimension
         self.output_proj = nn.Linear(hidden_size, hidden_size)
+        
+        # Layer type embedding (구분: text vs reference)
+        self.ref_type_embed = nn.Parameter(torch.zeros(1, 1, hidden_size))
 
         self.initialize_weights()
 
@@ -322,7 +316,7 @@ class ReferenceEncoder(nn.Module):
         self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
         
         nn.init.normal_(self.layer_embed, std=0.02)
-        nn.init.normal_(self.pool_token, std=0.02)
+        nn.init.normal_(self.ref_type_embed, std=0.02)
         
         w = self.patch_embed.proj.weight.data
         nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
@@ -330,50 +324,69 @@ class ReferenceEncoder(nn.Module):
     def forward(self, ref_layers):
         """
         ref_layers: (B, N_ref, C, H, W)
-        Returns: (B, D) aggregated reference embedding
+        Returns: (B, N_ref * T_compressed, D) - token sequence for cross-attention
         """
         B, N_ref, C, H, W = ref_layers.shape
 
         # Patch embed
         x = ref_layers.reshape(B * N_ref, C, H, W)
-        x = self.patch_embed(x)
+        x = self.patch_embed(x)  # (B*N_ref, T, D)
         
         T, D = x.shape[1], x.shape[2]
-        x = x.reshape(B, N_ref, T, D)
-
-        # Add positional embeddings
-        x = x + self.pos_embed.unsqueeze(1)
+        h = w = int(T ** 0.5)
+        
+        # Add positional embeddings before compression
+        x = x + self.pos_embed
+        
+        # Reshape for spatial compression
+        x = x.reshape(B * N_ref, h, w, D).permute(0, 3, 1, 2)  # (B*N_ref, D, h, w)
+        
+        # Spatial compression
+        x = self.spatial_compress(x)  # (B*N_ref, D, h', w')
+        h_comp, w_comp = x.shape[2], x.shape[3]
+        T_comp = h_comp * w_comp
+        
+        x = x.permute(0, 2, 3, 1).reshape(B * N_ref, T_comp, D)  # (B*N_ref, T_comp, D)
+        
+        # Reshape to (B, N_ref, T_comp, D)
+        x = x.reshape(B, N_ref, T_comp, D)
+        
+        # Add layer embeddings
         x = x + self.layer_embed[:, :N_ref, :, :]
-
-        # Flatten
-        x = x.reshape(B, N_ref * T, D)
-
-        # Prepend pool token
-        pool_tokens = self.pool_token.expand(B, -1, -1)
-        x = torch.cat([pool_tokens, x], dim=1)
-
-        # Encode
+        
+        # Flatten: (B, N_ref * T_comp, D)
+        x = x.reshape(B, N_ref * T_comp, D)
+        
+        # Add reference type embedding
+        x = x + self.ref_type_embed
+        
+        # Transformer encode
         for block in self.blocks:
             x = x + block['attn'](block['norm1'](x))
             x = x + block['mlp'](block['norm2'](x))
+        
+        # Output projection
+        x = self.output_proj(x)
+        
+        return x  # (B, N_ref * T_comp, D)
 
-        # Extract pool token
-        pooled = x[:, 0]
-        output = self.output_proj(pooled)
 
-        return output
+#################################################################################
+#         ReferencePixArt with Cross-Attention (CrossAttn Version)              #
+#################################################################################
 
-
-class ReferencePixArt(nn.Module):
+class ReferencePixArtCrossAttn(nn.Module):
     """
-    Reference-based PixArt for single layer generation with text + reference conditioning.
+    Cross-Attention 방식의 Reference 주입.
     
-    Input:
-        - x_target: (B, C, H, W) - target layer to generate
-        - timestep: (B,)
-        - y: (B, 1, L, caption_channels) - text embeddings
-        - x_ref: (B, N_ref, C, H, W) - reference layers
-    Output: (B, C_out, H, W)
+    기존 AdaLN 방식과 비교:
+    - AdaLN: ref_emb (B, D)를 timestep에 더해서 전체 네트워크에 broadcast
+    - CrossAttn: ref_tokens (B, N_tokens, D)를 text tokens와 concat하여 cross-attention
+    
+    장점:
+    - 공간적 세부 정보 더 잘 전달
+    - Reference의 어떤 부분을 참조하는지 attention으로 학습
+    - Text와 Reference 정보의 명시적 분리
     """
     def __init__(
         self,
@@ -392,7 +405,7 @@ class ReferencePixArt(nn.Module):
         model_max_length=120,
         max_ref_layers=15,
         ref_encoder_depth=4,
-        use_ref=True,
+        ref_compression_ratio=4,
         **kwargs
     ):
         super().__init__()
@@ -404,8 +417,9 @@ class ReferencePixArt(nn.Module):
         self.hidden_size = hidden_size
         self.lewei_scale = lewei_scale
         self.base_size = input_size // patch_size
+        self.max_ref_layers = max_ref_layers
 
-        # Target processing (standard PixArt)
+        # Target processing
         self.x_embedder = PatchEmbed(input_size, patch_size, in_channels, hidden_size, bias=True)
         self.t_embedder = TimestepEmbedder(hidden_size)
         
@@ -429,8 +443,8 @@ class ReferencePixArt(nn.Module):
             token_num=model_max_length
         )
 
-        # Reference encoder
-        self.ref_encoder = ReferenceEncoder(
+        # Reference Token Encoder (새로운!)
+        self.ref_encoder = ReferenceTokenEncoder(
             input_size=input_size,
             patch_size=patch_size,
             in_channels=in_channels,
@@ -439,15 +453,10 @@ class ReferencePixArt(nn.Module):
             depth=ref_encoder_depth,
             mlp_ratio=mlp_ratio,
             max_layers=max_ref_layers,
+            compression_ratio=ref_compression_ratio,
         )
 
-        # Reference conditioning projection
-        self.ref_proj = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(hidden_size, hidden_size),
-        )
-
-        # Transformer blocks (standard PixArt blocks)
+        # Transformer blocks
         drop_path_rates = [x.item() for x in torch.linspace(0, drop_path, depth)]
         self.blocks = nn.ModuleList([
             PixArtBlock(
@@ -460,20 +469,11 @@ class ReferencePixArt(nn.Module):
 
         # Final layer
         self.final_layer = T2IFinalLayer(hidden_size, patch_size, self.out_channels)
+        
+        # Gradient checkpointing flag
+        self.gradient_checkpointing = False
 
         self.initialize_weights()
-        self.gradient_checkpointing = False
-
-        self.use_ref = use_ref
-
-
-    def enable_gradient_checkpointing(self):
-        """Enable gradient checkpointing for memory savings."""
-        self.gradient_checkpointing = True
-
-    def disable_gradient_checkpointing(self):
-        """Disable gradient checkpointing."""
-        self.gradient_checkpointing = False
 
     def initialize_weights(self):
         def _basic_init(module):
@@ -498,8 +498,8 @@ class ReferencePixArt(nn.Module):
         nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
         nn.init.normal_(self.t_block[1].weight, std=0.02)
 
-        nn.init.normal_(self.y_embedder.y_proj.fc1.weight, std=0.02)
-        nn.init.normal_(self.y_embedder.y_proj.fc2.weight, std=0.02)
+        nn.init.normal_(self.y_embedder.y_proj[0].weight, std=0.02)
+        nn.init.normal_(self.y_embedder.y_proj[2].weight, std=0.02)
 
         for block in self.blocks:
             nn.init.constant_(block.cross_attn.proj.weight, 0)
@@ -507,6 +507,12 @@ class ReferencePixArt(nn.Module):
 
         nn.init.constant_(self.final_layer.linear.weight, 0)
         nn.init.constant_(self.final_layer.linear.bias, 0)
+
+    def enable_gradient_checkpointing(self):
+        self.gradient_checkpointing = True
+
+    def disable_gradient_checkpointing(self):
+        self.gradient_checkpointing = False
 
     def unpatchify(self, x):
         c = self.out_channels
@@ -519,6 +525,12 @@ class ReferencePixArt(nn.Module):
         return x.reshape(shape=(x.shape[0], c, h * p, h * p))
 
     def forward(self, x_target, timestep, y, x_ref, mask=None, **kwargs):
+        """
+        x_target: (B, C, H, W) - 노이즈 추가된 타겟
+        timestep: (B,) - diffusion timesteps
+        y: (B, 1, L, caption_channels) - text embeddings
+        x_ref: (B, N_ref, C, H, W) - 참조 레이어들 (clean)
+        """
         dtype = next(self.parameters()).dtype
         x_target = x_target.to(dtype)
         timestep = timestep.to(dtype)
@@ -526,93 +538,82 @@ class ReferencePixArt(nn.Module):
         x_ref = x_ref.to(dtype)
 
         B = x_target.shape[0]
+        N_ref = x_ref.shape[1]
 
-        # 1. Encode target
-        x = self.x_embedder(x_target) + self.pos_embed.to(dtype)
+        # 1. Target embedding
+        x = self.x_embedder(x_target) + self.pos_embed  # (B, T, D)
 
-        # 2. Encode reference
-        if self.use_ref:
-            ref_emb = self.ref_encoder(x_ref)
-            ref_emb = self.ref_proj(ref_emb)
-            t = self.t_embedder(timestep)
-            t = t + ref_emb
-        else:
-            t = self.t_embedder(timestep)
-
+        # 2. Timestep embedding (no reference added here!)
+        t = self.t_embedder(timestep)
         t0 = self.t_block(t)
 
-        # 4. Text embedding
-        y = self.y_embedder(y, self.training)
+        # 3. Text embedding
+        y = self.y_embedder(y, self.training)  # (B, 1, L, D)
         D = x.shape[-1]
-        if mask is not None:
-            if mask.shape[0] != y.shape[0]:
-                mask = mask.repeat(y.shape[0] // mask.shape[0], 1)
-            mask = mask.squeeze(1).squeeze(1)
-            y = y.squeeze(1).masked_select(mask.unsqueeze(-1) != 0).view(1, -1, D)
-        else:
-            y = y.squeeze(1).view(1, -1, D)
+        y = y.squeeze(1)  # (B, L, D)
 
-        # 5. Transformer blocks (수정됨)
+        # 4. Reference token encoding (핵심!)
+        ref_tokens = self.ref_encoder(x_ref)  # (B, N_ref * T_comp, D)
+
+        # 5. Concatenate text + reference tokens for cross-attention
+        # conditioning = [text_tokens, ref_tokens]
+        # Shape: (B, L + N_ref*T_comp, D)
+        cond_tokens = torch.cat([y, ref_tokens], dim=1)
+
+        # 6. Transformer blocks with combined cross-attention
         if self.gradient_checkpointing and self.training:
             from torch.utils.checkpoint import checkpoint
             for block in self.blocks:
-                x = checkpoint(block, x, y, t0, None, use_reentrant=False)
+                x = checkpoint(block, x, cond_tokens, t0, None, use_reentrant=False)
         else:
             for block in self.blocks:
-                x = block(x, y, t0)
+                x = block(x, cond_tokens, t0)
 
-        # 6. Final layer (squeeze 제거)
-        x = self.final_layer(x, t)
+        # 7. Final layer
+        t_final = t0[:, :2*D].reshape(B, 2, D)
+        x = self.final_layer(x, t_final)
 
-        # 7. Unpatchify
+        # 8. Unpatchify
         x = self.unpatchify(x)
 
         return x
 
     def forward_without_ref(self, x_target, timestep, y, mask=None):
-        """Forward without reference (for CFG)."""
+        """Reference 없이 forward (CFG용)"""
         dtype = next(self.parameters()).dtype
         x_target = x_target.to(dtype)
         timestep = timestep.to(dtype)
         y = y.to(dtype)
 
         B = x_target.shape[0]
-        x = self.x_embedder(x_target) + self.pos_embed.to(dtype)
+        x = self.x_embedder(x_target) + self.pos_embed
 
-        # Zero reference
-        ref_emb = torch.zeros(B, self.hidden_size, device=x_target.device, dtype=dtype)
-        ref_emb = self.ref_proj(ref_emb)
-
-        t = self.t_embedder(timestep) + ref_emb
+        t = self.t_embedder(timestep)
         t0 = self.t_block(t)
 
         y = self.y_embedder(y, self.training)
         D = x.shape[-1]
-        if mask is not None:
-            mask = mask.squeeze(1).squeeze(1)
-            y = y.squeeze(1).masked_select(mask.unsqueeze(-1) != 0).view(1, -1, D)
-        else:
-            y = y.squeeze(1).view(1, -1, D)
+        y = y.squeeze(1)  # (B, L, D)
 
-        # Transformer blocks (수정됨)
+        # Reference 없이 text만 사용
+        cond_tokens = y
+
         if self.gradient_checkpointing and self.training:
             from torch.utils.checkpoint import checkpoint
             for block in self.blocks:
-                x = checkpoint(block, x, y, t0, None, use_reentrant=False)
+                x = checkpoint(block, x, cond_tokens, t0, None, use_reentrant=False)
         else:
             for block in self.blocks:
-                x = block(x, y, t0)
+                x = block(x, cond_tokens, t0)
 
-        # Final layer (squeeze 제거)
-        #t_final = t0[:, :2*D].reshape(B, 2, D)
-        #x = self.final_layer(x, t_final)
-        x = self.final_layer(x, t)
+        t_final = t0[:, :2*D].reshape(B, 2, D)
+        x = self.final_layer(x, t_final)
         x = self.unpatchify(x)
 
         return x
 
     def forward_with_cfg(self, x_target, timestep, y, x_ref, cfg_scale, mask=None, **kwargs):
-        """Forward with classifier-free guidance on both text and reference."""
+        """Classifier-free guidance"""
         cond_out = self.forward(x_target, timestep, y, x_ref, mask)
         uncond_out = self.forward_without_ref(x_target, timestep, y, mask)
 
@@ -639,37 +640,14 @@ class ReferencePixArt(nn.Module):
 #                              Model Configurations                             #
 #################################################################################
 
-def MultiLayerPixArt_XL_2(**kwargs):
-    return MultiLayerPixArt(depth=28, hidden_size=1152, patch_size=2, num_heads=16, **kwargs)
+def ReferencePixArtCrossAttn_XL_2(**kwargs):
+    return ReferencePixArtCrossAttn(depth=28, hidden_size=1152, patch_size=2, num_heads=16, **kwargs)
 
-def MultiLayerPixArt_L_2(**kwargs):
-    return MultiLayerPixArt(depth=24, hidden_size=1024, patch_size=2, num_heads=16, **kwargs)
+def ReferencePixArtCrossAttn_L_2(**kwargs):
+    return ReferencePixArtCrossAttn(depth=24, hidden_size=1024, patch_size=2, num_heads=16, **kwargs)
 
-def MultiLayerPixArt_B_2(**kwargs):
-    return MultiLayerPixArt(depth=12, hidden_size=768, patch_size=2, num_heads=12, **kwargs)
-
-
-def ReferencePixArt_XL_2(**kwargs):
-    return ReferencePixArt(depth=28, hidden_size=1152, patch_size=2, num_heads=16, **kwargs)
-
-def ReferencePixArt_L_2(**kwargs):
-    return ReferencePixArt(depth=24, hidden_size=1024, patch_size=2, num_heads=16, **kwargs)
-
-def ReferencePixArt_B_2(**kwargs):
-    return ReferencePixArt(depth=12, hidden_size=768, patch_size=2, num_heads=12, **kwargs)
-
-
-MultiLayerPixArt_models = {
-    'MultiLayerPixArt-XL/2': MultiLayerPixArt_XL_2,
-    'MultiLayerPixArt-L/2': MultiLayerPixArt_L_2,
-    'MultiLayerPixArt-B/2': MultiLayerPixArt_B_2,
-}
-
-ReferencePixArt_models = {
-    'ReferencePixArt-XL/2': ReferencePixArt_XL_2,
-    'ReferencePixArt-L/2': ReferencePixArt_L_2,
-    'ReferencePixArt-B/2': ReferencePixArt_B_2,
-}
+def ReferencePixArtCrossAttn_B_2(**kwargs):
+    return ReferencePixArtCrossAttn(depth=12, hidden_size=768, patch_size=2, num_heads=12, **kwargs)
 
 
 #################################################################################
@@ -682,77 +660,67 @@ if __name__ == "__main__":
 
     # Test parameters
     B = 2
-    N = 4  # num layers
-    C = 4  # RGBA
-    H = W = 64  # image size (will be 64x64, latent of 512x512)
-    caption_channels = 4096  # T5-XXL dimension
-    L = 120  # max text length
+    N_ref = 3
+    C = 4
+    H = W = 32  # latent size for 256px
+    caption_channels = 4096
+    L = 120
 
-    # Test MultiLayerPixArt
     print("\n" + "="*60)
-    print("Testing MultiLayerPixArt")
+    print("Testing ReferencePixArtCrossAttn")
     print("="*60)
 
-    model1 = MultiLayerPixArt_B_2(
-        input_size=H,
-        in_channels=C,
-        max_layers=8,
-        caption_channels=caption_channels,
-        model_max_length=L,
-        pred_sigma=False,
-    ).to(device)
-
-    x1 = torch.randn(B, N, C, H, W).to(device)
-    t1 = torch.randint(0, 1000, (B,)).to(device)
-    y1 = torch.randn(B, 1, L, caption_channels).to(device)
-
-    with torch.no_grad():
-        out1 = model1(x1, t1, y1)
-
-    print(f"Input shape:   {x1.shape}")
-    print(f"Text shape:    {y1.shape}")
-    print(f"Output shape:  {out1.shape}")
-    print(f"Expected:      (B={B}, N={N}, C_out={C}, H={H}, W={W})")
-
-    params1 = sum(p.numel() for p in model1.parameters())
-    print(f"Parameters:    {params1:,}")
-
-    # Test ReferencePixArt
-    print("\n" + "="*60)
-    print("Testing ReferencePixArt")
-    print("="*60)
-
-    model2 = ReferencePixArt_B_2(
+    model = ReferencePixArtCrossAttn_B_2(
         input_size=H,
         in_channels=C,
         max_ref_layers=7,
         ref_encoder_depth=2,
+        ref_compression_ratio=2,  # 압축 비율
         caption_channels=caption_channels,
         model_max_length=L,
         pred_sigma=False,
     ).to(device)
 
     x_target = torch.randn(B, C, H, W).to(device)
-    x_ref = torch.randn(B, 3, C, H, W).to(device)
-    t2 = torch.randint(0, 1000, (B,)).to(device)
-    y2 = torch.randn(B, 1, L, caption_channels).to(device)
-
-    with torch.no_grad():
-        out2 = model2(x_target, t2, y2, x_ref)
+    x_ref = torch.randn(B, N_ref, C, H, W).to(device)
+    t = torch.randint(0, 1000, (B,)).to(device)
+    y = torch.randn(B, 1, L, caption_channels).to(device)
 
     print(f"Target shape:     {x_target.shape}")
     print(f"Reference shape:  {x_ref.shape}")
-    print(f"Text shape:       {y2.shape}")
-    print(f"Output shape:     {out2.shape}")
+    print(f"Text shape:       {y.shape}")
+
+    # Test reference token encoder
+    ref_tokens = model.ref_encoder(x_ref)
+    print(f"Ref tokens shape: {ref_tokens.shape}")
+    print(f"  (N_ref={N_ref}, T_compressed={ref_tokens.shape[1]//N_ref})")
+
+    with torch.no_grad():
+        out = model(x_target, t, y, x_ref)
+
+    print(f"Output shape:     {out.shape}")
     print(f"Expected:         (B={B}, C_out={C}, H={H}, W={W})")
+
+    # Test without ref
+    with torch.no_grad():
+        out_no_ref = model.forward_without_ref(x_target, t, y)
+    print(f"No-ref output:    {out_no_ref.shape}")
 
     # Test CFG
     with torch.no_grad():
-        out2_cfg = model2.forward_with_cfg(x_target, t2, y2, x_ref, cfg_scale=4.5)
-    print(f"CFG output shape: {out2_cfg.shape}")
+        out_cfg = model.forward_with_cfg(x_target, t, y, x_ref, cfg_scale=4.5)
+    print(f"CFG output:       {out_cfg.shape}")
 
-    params2 = sum(p.numel() for p in model2.parameters())
-    print(f"Parameters:       {params2:,}")
+    params = sum(p.numel() for p in model.parameters())
+    print(f"Parameters:       {params:,}")
+
+    # Memory estimate
+    if device == "cuda":
+        torch.cuda.reset_peak_memory_stats()
+        with torch.no_grad():
+            _ = model(x_target, t, y, x_ref)
+        mem = torch.cuda.max_memory_allocated() / 1024**3
+        print(f"Peak memory:      {mem:.2f} GB (inference)")
 
     print("\n" + "="*60)
     print("All tests passed!")

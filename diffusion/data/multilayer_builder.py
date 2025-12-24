@@ -63,6 +63,7 @@ class MuLanDataset(Dataset):
         self.transform = T.Compose([
             T.Resize((resolution, resolution), interpolation=T.InterpolationMode.BILINEAR),
             T.ToTensor(),  # [0, 255] -> [0, 1]
+            T.Normalize([0.5, 0.5, 0.5, 0.5], [0.5, 0.5, 0.5, 0.5]),  # [0, 1] -> [-1, 1] (RGBA 4채널)
         ])
     
     def _load_from_csv(self, data_roots: List[str]) -> Dict[str, Dict]:

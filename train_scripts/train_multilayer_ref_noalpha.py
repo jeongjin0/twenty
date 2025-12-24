@@ -43,6 +43,35 @@ current_file_path = Path(__file__).resolve()
 sys.path.insert(0, str(current_file_path.parent.parent))
 
 
+def setup_freeze(model, freeze_pretrained=True):
+    must_train = [
+        'ref_encoder',    # 새로 추가됨
+        'pos_embed',      # Resize됨 → 학습 필요!
+    ]
+    
+    frozen_count = 0
+    trainable_count = 0
+    
+    for name, param in model.named_parameters():
+        if any(key in name for key in must_train):
+            param.requires_grad = True
+            trainable_count += 1
+        elif freeze_pretrained:
+            param.requires_grad = False
+            frozen_count += 1
+        else:
+            param.requires_grad = True
+            trainable_count += 1
+    
+    print(f"[Freeze] Frozen: {frozen_count}, Trainable: {trainable_count}")
+    
+    # 학습되는 파라미터 확인
+    trainable_params = [n for n, p in model.named_parameters() if p.requires_grad]
+    print(f"[Trainable params]: {trainable_params[:10]}...")  # 처음 10개만
+    
+    return model
+
+
 def print_gpu_memory(tag=""):
     """GPU 메모리 사용량 출력"""
     if torch.cuda.is_available():
@@ -57,62 +86,42 @@ def reset_memory_stats():
     torch.cuda.empty_cache()
 
 
-def encode_reference_vae_rgba_batch(vae, layers, num_layers, target_indices, scale_factor=0.18215):
+def encode_reference_vae_rgb_batch(vae, layers, num_layers, target_indices, scale_factor=0.18215):
     """
-    Batch별로 다른 target_idx를 처리하는 VAE 인코딩
-    
-    Args:
-        layers: (B, N, 4, H, W)
-        num_layers: (B,)
-        target_indices: List[int] of length B
-        scale_factor: VAE scale factor
+    Alpha 없이 RGB만 처리하는 VAE 인코딩
     
     Returns:
-        z_target: (B, 5, h, w)
-        z_ref: (B, max_ref, 5, h, w)
+        z_target: (B, 4, h, w)
+        z_ref: (B, max_ref, 4, h, w)
     """
     B, N, C, H, W = layers.shape
     device = layers.device
     
-    # 전체 VAE encoding
+    # RGB만 VAE encoding
     rgb = layers[:, :, :3, :, :]  # (B, N, 3, H, W)
-    alpha = layers[:, :, 3:4, :, :]  # (B, N, 1, H, W)
     
     rgb_flat = rgb.reshape(B * N, 3, H, W)
     z_rgb_flat = vae.encode(rgb_flat).latent_dist.mode() * scale_factor
     
-    _, C_latent, h, w = z_rgb_flat.shape
-    z_rgb = z_rgb_flat.reshape(B, N, C_latent, h, w)
-    
-    # Alpha downsample
-    alpha_flat = alpha.reshape(B * N, 1, H, W)
-    alpha_down = F.interpolate(alpha_flat, size=(h, w), mode='bilinear', align_corners=False)
-    alpha_down = alpha_down.reshape(B, N, 1, h, w)
-    
-    # Concat: (B, N, 5, h, w)
-    z_all = torch.cat([z_rgb, alpha_down], dim=2)
+    _, C_latent, h, w = z_rgb_flat.shape  # C_latent = 4
+    z_all = z_rgb_flat.reshape(B, N, C_latent, h, w)  # (B, N, 4, h, w)
     
     # Batch별로 target/reference 분리
     z_target_list = []
     z_ref_list = []
-    max_ref = N - 1
     
     for b in range(B):
         t_idx = target_indices[b]
+        z_target_list.append(z_all[b, t_idx])  # (4, h, w)
         
-        # Target
-        z_target_list.append(z_all[b, t_idx])  # (5, h, w)
-        
-        # Reference (target 제외)
         ref_indices = [i for i in range(N) if i != t_idx]
-        z_ref_b = z_all[b, ref_indices]  # (N-1, 5, h, w)
+        z_ref_b = z_all[b, ref_indices]  # (N-1, 4, h, w)
         z_ref_list.append(z_ref_b)
     
-    z_target = torch.stack(z_target_list, dim=0)  # (B, 5, h, w)
-    z_ref = torch.stack(z_ref_list, dim=0)  # (B, N-1, 5, h, w)
+    z_target = torch.stack(z_target_list, dim=0)  # (B, 4, h, w)
+    z_ref = torch.stack(z_ref_list, dim=0)  # (B, N-1, 4, h, w)
     
     return z_target, z_ref
-
 
 
 def set_fsdp_env():
@@ -129,133 +138,6 @@ def ema_update(model_dest: nn.Module, model_src: nn.Module, rate):
         assert p_src is not p_dest
         p_dest.data.mul_(rate).add_((1 - rate) * p_src.data)
 
-
-def debug_compare_training_inference(model, vae, multilayer_diffusion, z_target, z_ref, y, config):
-    """Training과 Inference 과정을 직접 비교"""
-    
-    print("="*60)
-    print("[DEBUG] Training vs Inference 직접 비교")
-    print("="*60)
-    
-    device = z_target.device
-    model.eval()
-    
-    # 여러 timestep에서 테스트
-    test_timesteps = [0, 100, 250, 500, 750, 999]
-    
-    for t_val in test_timesteps:
-        t = torch.tensor([t_val], device=device)
-        noise = torch.randn_like(z_target[:1])
-        
-        # q_sample (Training 방식)
-        sqrt_alpha = multilayer_diffusion.iddpm.sqrt_alphas_cumprod[t_val]
-        sqrt_one_minus = multilayer_diffusion.iddpm.sqrt_one_minus_alphas_cumprod[t_val]
-        if isinstance(sqrt_alpha, np.ndarray):
-            sqrt_alpha = torch.tensor(sqrt_alpha, device=device)
-            sqrt_one_minus = torch.tensor(sqrt_one_minus, device=device)
-        else:
-            sqrt_alpha = torch.tensor(sqrt_alpha).clone().detach().to(device)
-            sqrt_one_minus = torch.tensor(sqrt_one_minus).clone().detach().to(device)
-        
-        x_t = sqrt_alpha * z_target[:1] + sqrt_one_minus * noise
-        
-        # Model forward
-        with torch.no_grad():
-            model_output = model(
-                x_target=x_t,
-                timestep=t,
-                y=y[:1],
-                x_ref=z_ref[:1],
-                mask=None,
-            )
-        
-        # pred_sigma 처리
-        if model_output.shape[1] == 10:
-            noise_pred = model_output[:, :5]
-        else:
-            noise_pred = model_output
-        
-        # Loss 계산
-        loss = F.mse_loss(noise_pred, noise)
-        
-        # 채널별 loss
-        loss_rgb = F.mse_loss(noise_pred[:, :4], noise[:, :4])
-        loss_alpha = F.mse_loss(noise_pred[:, 4:], noise[:, 4:])
-        
-        print(f"\n[t={t_val}]")
-        print(f"  Total Loss: {loss.item():.6f}")
-        print(f"  RGB Loss: {loss_rgb.item():.6f}")
-        print(f"  Alpha Loss: {loss_alpha.item():.6f}")
-        print(f"  noise     - mean: {noise.mean():.4f}, std: {noise.std():.4f}")
-        print(f"  noise_pred- mean: {noise_pred.mean():.4f}, std: {noise_pred.std():.4f}")
-        print(f"  noise_pred RGB std: {noise_pred[:, :4].std():.4f}")
-        print(f"  noise_pred Alpha std: {noise_pred[:, 4:].std():.4f}")
-    
-    # x0 reconstruction 테스트
-    print("\n" + "-"*40)
-    print("[x0 Reconstruction 테스트]")
-    t_test = torch.tensor([500], device=device)
-    noise = torch.randn_like(z_target[:1])
-    
-    sqrt_alpha = multilayer_diffusion.iddpm.sqrt_alphas_cumprod[500]
-    sqrt_one_minus = multilayer_diffusion.iddpm.sqrt_one_minus_alphas_cumprod[500]
-    if isinstance(sqrt_alpha, np.ndarray):
-        sqrt_alpha = torch.tensor(sqrt_alpha, device=device)
-        sqrt_one_minus = torch.tensor(sqrt_one_minus, device=device)
-    
-    x_t = sqrt_alpha * z_target[:1] + sqrt_one_minus * noise
-    
-    with torch.no_grad():
-        model_output = model(x_t, t_test, y[:1], z_ref[:1], mask=None)
-        if model_output.shape[1] == 10:
-            noise_pred = model_output[:, :5]
-        else:
-            noise_pred = model_output
-    
-    x0_pred = (x_t - sqrt_one_minus * noise_pred) / sqrt_alpha
-    
-    print(f"z_target    - mean: {z_target[:1].mean():.4f}, std: {z_target[:1].std():.4f}")
-    print(f"x0_pred     - mean: {x0_pred.mean():.4f}, std: {x0_pred.std():.4f}")
-    print(f"Diff (MAE): {(x0_pred - z_target[:1]).abs().mean():.4f}")
-    
-    print(f"\n채널별 비교:")
-    for i in range(5):
-        ch_name = f"ch{i}" if i < 4 else "Alpha"
-        gt_mean = z_target[:1, i].mean().item()
-        gt_std = z_target[:1, i].std().item()
-        pred_mean = x0_pred[:, i].mean().item()
-        pred_std = x0_pred[:, i].std().item()
-        diff = (x0_pred[:, i] - z_target[:1, i]).abs().mean().item()
-        print(f"  {ch_name}: GT({gt_mean:.3f}±{gt_std:.3f}) vs Pred({pred_mean:.3f}±{pred_std:.3f}), Diff={diff:.4f}")
-    
-    # Decode 비교
-    print("\n" + "-"*40)
-    print("[VAE Decode 비교]")
-    with torch.no_grad():
-        gt_decode = vae.decode(z_target[:1, :4] / config.scale_factor).sample
-        pred_decode = vae.decode(x0_pred[:, :4] / config.scale_factor).sample
-        
-        print(f"GT decode   - mean: {gt_decode.mean():.4f}, std: {gt_decode.std():.4f}")
-        print(f"Pred decode - mean: {pred_decode.mean():.4f}, std: {pred_decode.std():.4f}")
-    
-
-    print(f"config.scale_factor: {config.scale_factor}")
-    print(f"z_target[:1, :4] stats: mean={z_target[:1, :4].mean():.4f}, std={z_target[:1, :4].std():.4f}")
-
-    z_for_decode = z_target[:1, :4] / config.scale_factor
-    print(f"z_for_decode stats: mean={z_for_decode.mean():.4f}, std={z_for_decode.std():.4f}")
-    print(f"z_for_decode: min={z_for_decode.min():.4f}, max={z_for_decode.max():.4f}")
-
-    gt_decode = vae.decode(z_for_decode).sample
-    print(f"GT decode: mean={gt_decode.mean():.4f}, std={gt_decode.std():.4f}")
-
-    print("="*60)
-    
-    return {
-        'gt_decode': gt_decode,
-        'pred_decode': pred_decode,
-        'x0_pred': x0_pred,
-    }
 
 def run_evaluation(model, vae, multilayer_diffusion, dataloader, text_encoder, 
                    accelerator, config, epoch, step, save_dir):
@@ -275,7 +157,7 @@ def run_evaluation(model, vae, multilayer_diffusion, dataloader, text_encoder,
         target_idx = torch.randint(0, actual_layers, (1,)).item() #target layer is 0 or 1
         target_indices = [min(target_idx, num_layers[b].item() - 1) for b in range(B)]
 
-        z_target, z_ref = encode_reference_vae_rgba_batch(
+        z_target, z_ref = encode_reference_vae_rgb_batch(
             vae, layers, num_layers,
             target_indices=target_indices,
             scale_factor=config.scale_factor
@@ -286,33 +168,7 @@ def run_evaluation(model, vae, multilayer_diffusion, dataloader, text_encoder,
         caption_embs, emb_masks = text_encoder.get_text_embeddings(target_captions)
         y = caption_embs.float()[:, None]
     
-    # # ★ 디버깅 비교 실행
-    # import numpy as np  # 상단에 없으면 추가
-    # debug_results = debug_compare_training_inference(
-    #     model=accelerator.unwrap_model(model),
-    #     vae=vae,
-    #     multilayer_diffusion=multilayer_diffusion,
-    #     z_target=z_target,
-    #     z_ref=z_ref,
-    #     y=y,
-    #     config=config,
-    # )
 
-
-    # # z_target 상세 출력
-    # print(f"target_idx: {target_idx}")
-    # print(f"num_layers[0]: {num_layers[0].item()}")
-    # print(f"z_target 채널별:")
-    # for i in range(5):
-    #     print(f"  ch{i}: min={z_target[0,i].min():.4f}, max={z_target[0,i].max():.4f}, mean={z_target[0,i].mean():.4f}")
-    
-    # # 디버깅 이미지 저장
-    # os.makedirs(save_dir, exist_ok=True)
-    # save_image(debug_results['gt_decode'], os.path.join(save_dir, f'debug_gt_decode_e{epoch}_s{step}.png'), 
-    #            normalize=True, value_range=(-1, 1))
-    # save_image(debug_results['pred_decode'], os.path.join(save_dir, f'debug_pred_decode_e{epoch}_s{step}.png'), 
-    #            normalize=True, value_range=(-1, 1))
-    
     with torch.no_grad():
           
         # Evaluate
@@ -354,8 +210,32 @@ def run_evaluation(model, vae, multilayer_diffusion, dataloader, text_encoder,
     model.train()
     return results['mse']
 
+def init_ref_proj_zero(model):
+    """ref_proj 출력을 0으로 초기화"""
+    if hasattr(model, 'ref_proj'):
+        ref_proj = model.ref_proj
+        if isinstance(ref_proj, nn.Linear):
+            nn.init.zeros_(ref_proj.weight)
+            if ref_proj.bias is not None:
+                nn.init.zeros_(ref_proj.bias)
+            print("✓ ref_proj (Linear) initialized to zero")
+        elif isinstance(ref_proj, nn.Sequential):
+            # 마지막 layer만 0으로
+            for layer in reversed(list(ref_proj.modules())):
+                if isinstance(layer, nn.Linear):
+                    nn.init.zeros_(layer.weight)
+                    if layer.bias is not None:
+                        nn.init.zeros_(layer.bias)
+                    print("✓ ref_proj (Sequential) last Linear initialized to zero")
+                    break
+    else:
+        print("⚠ model has no ref_proj attribute")
 
 def train():
+    global optimizer, model
+    #init_ref_proj_zero(model)
+    #model = setup_freeze(model, freeze_pretrained=True)
+
     if config.get('debug_nan', False):
         DebugUnderflowOverflow(model)
         logger.info('NaN debugger registered. Start to detect overflow during training.')
@@ -386,7 +266,7 @@ def train():
             with torch.no_grad():
                 # 각 샘플마다 유효 레이어 범위 내에서 랜덤 target 선택
                 target_indices = [torch.randint(0, num_layers[b].item(), (1,)).item() for b in range(B)]
-                z_target, z_ref = encode_reference_vae_rgba_batch(
+                z_target, z_ref = encode_reference_vae_rgb_batch(
                     vae, layers, num_layers,
                     target_indices=target_indices,
                     scale_factor=config.scale_factor
@@ -425,11 +305,50 @@ def train():
                 if accelerator.sync_gradients:
                     grad_norm = accelerator.clip_grad_norm_(model.parameters(), config.gradient_clip)
                 
+
+
+                def debug_check_parameters(model, optimizer, accelerator, step):
+                    accelerator.print(f"\n[DEBUG] Step {step}")
+
+                    total = 0
+                    frozen = 0
+                    has_grad = 0
+
+                    for name, p in model.named_parameters():
+                        total += 1
+
+                        req = p.requires_grad
+                        grad = p.grad
+
+                        if not req:
+                            frozen += 1
+
+                        if grad is not None:
+                            has_grad += 1
+
+                        if not req or grad is None:
+                            accelerator.print(
+                                f"{name:60s} | requires_grad={req} | grad={'YES' if grad is not None else 'NO'}"
+                            )
+
+                    accelerator.print(
+                        f"\n[SUMMARY] total={total}, frozen={frozen}, grad_present={has_grad}\n"
+                    )
+                
+
                 optimizer.step()
                 lr_scheduler.step()
                 
                 if accelerator.sync_gradients:
                     ema_update(model_ema, model, config.ema_rate)
+
+            if global_step == 10000:
+                logger.info(f"[Step {global_step}] Unfreezing all layers")
+                for param in model.parameters():
+                    param.requires_grad = True
+                
+                # optimizer = build_optimizer(accelerator.unwrap_model(model), config.optimizer)
+                # optimizer = accelerator.prepare(optimizer)
 
             # ============================================
             # 6. Logging
@@ -534,6 +453,8 @@ def parse_args():
     parser.add_argument('--local-rank', type=int, default=-1)
     parser.add_argument('--local_rank', type=int, default=-1)
     parser.add_argument('--debug', action='store_true')
+    parser.add_argument('--use_ref', default=True)
+
     parser.add_argument(
         "--report_to",
         type=str,
@@ -555,6 +476,21 @@ if __name__ == '__main__':
     args = parse_args()
     config = read_config(args.config)
     
+    #print args
+    if accelerator.is_main_process:
+        print("Arguments:")
+        for k, v in vars(args).items():
+            print(f"{k}: {v}")
+
+        if args.use_ref:
+            print("✓ Running with reference images!")
+        else:
+            print("⚠ Running without reference images!")
+
+
+    if args.use_ref == 'False' or args.use_ref == 'false':
+        args.use_ref = False
+        
     if args.work_dir is not None:
         config.work_dir = args.work_dir
     if args.cloud:
@@ -650,16 +586,6 @@ if __name__ == '__main__':
     # ============================================
     # Build MultiLayerPixArt Model
     # ============================================
-    from diffusion.model.nets.PixArt_multilayer import ReferencePixArt_XL_2
-    model = ReferencePixArt_XL_2(
-        input_size=latent_size,
-        in_channels=5,
-        max_ref_layers=max_layers - 1,  # 타겟 제외
-        ref_encoder_depth=4,
-        caption_channels=4096,
-        model_max_length=config.model_max_length,
-        pred_sigma=pred_sigma,
-    ).train()
 
 
     model_type = 'adaln'
@@ -669,18 +595,19 @@ if __name__ == '__main__':
         from diffusion.model.nets.PixArt_multilayer import ReferencePixArt_XL_2
         model = ReferencePixArt_XL_2(
             input_size=latent_size,
-            in_channels=5,
+            in_channels=4,
             max_ref_layers=max_layers - 1,
             ref_encoder_depth=4,
             caption_channels=4096,
             model_max_length=config.model_max_length,
             pred_sigma=pred_sigma,
+            use_ref=args.use_ref,
         ).train()
     elif model_type == 'crossattn':
         from diffusion.model.nets.PixArt_reference_crossattn import ReferencePixArtCrossAttn_XL_2
         model = ReferencePixArtCrossAttn_XL_2(
             input_size=latent_size,\
-            in_channels=5,
+            in_channels=4,
             max_ref_layers=max_layers - 1,
             ref_encoder_depth=4,
             ref_compression_ratio=4, 
@@ -696,82 +623,6 @@ if __name__ == '__main__':
     logger.info(f"Model Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
 
-
-
-    print("\n" + "="*60)
-    print("Model Architecture Diagnosis:")
-    print("="*60)
-
-    # x_embedder 확인
-    print(f"\n[x_embedder]")
-    print(f"  weight shape: {model.x_embedder.proj.weight.shape}")
-    print(f"  → Input channels: {model.x_embedder.proj.weight.shape[1]}")
-
-    # final_layer 확인
-    print(f"\n[final_layer]")
-    print(f"  linear weight shape: {model.final_layer.linear.weight.shape}")
-    out_features = model.final_layer.linear.weight.shape[0]
-    patch_size = model.patch_size
-    out_channels = out_features // (patch_size * patch_size)
-    print(f"  → Output channels: {out_channels} (patch_size={patch_size})")
-
-    # y_embedder 확인
-    print(f"\n[y_embedder]")
-    print(f"  y_proj[0] (Linear) weight shape: {model.y_embedder.y_proj[0].weight.shape}")
-    print(f"  y_proj[2] (Linear) weight shape: {model.y_embedder.y_proj[2].weight.shape}")
-
-    # Reference encoder 확인
-    if hasattr(model, 'ref_encoder'):
-        print(f"\n[ref_encoder]")
-        print(f"  Has reference encoder: True")
-        ref_params = sum(p.numel() for p in model.ref_encoder.parameters())
-        print(f"  Parameters: {ref_params:,}")
-        print(f"  patch_embed weight shape: {model.ref_encoder.patch_embed.proj.weight.shape}")
-        print(f"  → Input channels: {model.ref_encoder.patch_embed.proj.weight.shape[1]}")
-    else:
-        print(f"\n[ref_encoder]")
-        print(f"  Has reference encoder: False")
-
-    print("="*60 + "\n")
-
-
-
-
-
-    # ============================================
-    # Load Pretrained PixArt Weights
-    # ============================================
-    # pretrained_path = getattr(config, 'pretrained_pixart', None)
-
-    # if pretrained_path is not None:
-    #     logger.info(f"Loading pretrained weights from: {pretrained_path}")
-
-    #     if pretrained_path.endswith('.pth'):
-    #         checkpoint = torch.load(pretrained_path, map_location='cpu')
-    #         pretrained_state_dict = checkpoint['state_dict']
-            
-    #         # Position embedding resize
-    #         if 'pos_embed' in pretrained_state_dict:
-    #             old_pos_embed = pretrained_state_dict['pos_embed']
-    #             new_size = model.pos_embed.shape[1]
-    #             old_size = old_pos_embed.shape[1]
-                
-    #             if old_size != new_size:
-    #                 print(f"Resizing pos_embed: {old_size} -> {new_size}")
-    #                 pretrained_state_dict['pos_embed'] = F.interpolate(
-    #                     old_pos_embed.reshape(1, int(old_size**0.5), int(old_size**0.5), -1).permute(0,3,1,2),
-    #                     size=(int(new_size**0.5), int(new_size**0.5)),
-    #                     mode='bilinear'
-    #                 ).permute(0,2,3,1).reshape(1, new_size, -1)
-    #     else:
-    #         raise ValueError("Unsupported pretrained format. Use .pth files.")
-
-    #     missing_keys = model.load_pretrained_pixart(pretrained_state_dict)
-    #     logger.info(f"Loaded pretrained. Missing keys (new layers): {len(missing_keys)}")
-    #     if len(missing_keys) > 0 and len(missing_keys) <= 20:
-    #         logger.info(f"Missing keys: {missing_keys}")
-    # else:
-    #     logger.info("Training from scratch.")
 
 
 
@@ -862,21 +713,27 @@ if __name__ == '__main__':
                         mode='bilinear'
                     ).permute(0,2,3,1).reshape(1, new_size, -1)
                     logger.info(f"  ✓ pos_embed resized")
-            key_mapping = {
-                'y_embedder.y_proj.0.weight': 'y_embedder.y_proj.fc1.weight',
-                'y_embedder.y_proj.0.bias': 'y_embedder.y_proj.fc1.bias',
-                'y_embedder.y_proj.2.weight': 'y_embedder.y_proj.fc2.weight',
-                'y_embedder.y_proj.2.bias': 'y_embedder.y_proj.fc2.bias',
-            }
             
-            mapped_count = 0
-            for old_key, new_key in key_mapping.items():
-                if old_key in pretrained_state_dict:
-                    pretrained_state_dict[new_key] = pretrained_state_dict.pop(old_key)
-                    mapped_count += 1
+            # ============================================================
+            # 0. 디버깅: y_embedder 키 확인 ⭐
+            # ============================================================
+            y_keys = [k for k in pretrained_state_dict.keys() if 'y_embedder' in k]
+            logger.info(f"🔍 Pretrained y_embedder keys ({len(y_keys)}):")
+            for k in y_keys:
+                logger.info(f"    {k}")
             
-            if mapped_count > 0:
-                logger.info(f"  ✓ y_embedder keys mapped: {mapped_count}/4")
+            # Shape 비교
+            model_dict = model.state_dict()
+            logger.info(f"🔍 Shape comparison:")
+            for k in y_keys:
+                if k in model_dict:
+                    pre_shape = pretrained_state_dict[k].shape
+                    model_shape = model_dict[k].shape
+                    match = "✓" if pre_shape == model_shape else "✗"
+                    logger.info(f"    {match} {k}")
+                    logger.info(f"        Pretrained: {pre_shape}")
+                    logger.info(f"        Model:      {model_shape}")
+            
         else:
             raise ValueError("Unsupported pretrained format.")
 
@@ -894,6 +751,7 @@ if __name__ == '__main__':
         logger.info(f"Resumed training. Missing keys: {len(missing_keys)}")
         if len(missing_keys) > 0 and len(missing_keys) <= 20:
             logger.info(f"Missing keys: {missing_keys}")
+
 
     # Create EMA model
     model_ema = deepcopy(model).eval()

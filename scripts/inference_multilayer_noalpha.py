@@ -36,9 +36,11 @@ class SimpleDDIMSampler:
         self.alphas_cumprod = torch.cumprod(alphas, dim=0)
     
     @torch.no_grad()
-    def sample(self, model, shape, y, x_ref, cfg_scale=4.5, steps=20, device='cuda'):
+    def sample(self, model, shape, y, y_mask, x_ref, cfg_scale=4.5, steps=20, device='cuda'):
         """DDIM Sampling with reference"""
         self.alphas_cumprod = self.alphas_cumprod.to(device)
+        print("model use_ref:", model.use_ref)
+
         
         x = torch.randn(shape, device=device)
         timesteps = torch.linspace(self.num_timesteps - 1, 0, steps + 1, dtype=torch.long, device=device)
@@ -58,7 +60,14 @@ class SimpleDDIMSampler:
 
             x_ref_in = torch.cat([x_ref, x_ref], dim=0)
             
-            noise_pred = model(x_in, t_in, y_in, x_ref_in, mask=None)
+            null_mask = torch.ones(1, y_mask.shape[1], device=y_mask.device, dtype=y_mask.dtype)
+            mask_in = torch.cat([y_mask, null_mask], dim=0)
+
+            try:
+                noise_pred = model(x_in, t_in, y_in, x_ref_in, mask=mask_in)
+            except:
+                noise_pred = model(x_in, t_in, y_in, mask=mask_in)
+
             
             noise_pred_cond, noise_pred_uncond = noise_pred.chunk(2, dim=0)
             # pred_sigma=True면 출력이 2*in_channels (noise + sigma)
@@ -109,6 +118,8 @@ def main():
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--t5_path', type=str, default='/workspace/twenty/PixArt-alpha')
     parser.add_argument('--vae_path', type=str, default='/workspace/twenty/PixArt-alpha/sd-vae-ft-ema')
+    parser.add_argument("--use_ref", action="store_true")
+    parser.add_argument("--no_use_ref", action="store_false", dest="use_ref")
     args = parser.parse_args()
     
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -132,19 +143,35 @@ def main():
 
     model = ReferencePixArt_XL_2(
         input_size=latent_size,
-        in_channels=5,
+        in_channels=4,
         max_ref_layers=7,
         ref_encoder_depth=4,
         caption_channels=4096,
         model_max_length=120,
         pred_sigma=True,
+        use_ref=args.use_ref,
     ).to(device).eval()
+    print("model use_ref:", model.use_ref)
+    print("args use ref:", args.use_ref)
+
+
+    # from diffusion.model.nets.PixArt import PixArt_XL_2
+
+    # model = PixArt_XL_2(
+    #     input_size=latent_size,
+    #     in_channels=4,
+    #     caption_channels=4096,
+    #     model_max_length=120,
+    #     pred_sigma=True,
+    # ).to(device).eval()
+
     
     ckpt = torch.load(args.checkpoint, map_location='cpu')
     state_dict = ckpt.get('state_dict', ckpt.get('model', ckpt))
     state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
-    model.load_state_dict(state_dict, strict=False)
+    missing_keys = model.load_state_dict(state_dict, strict=False)
     print(f"  ✓ Model loaded")
+    print(f"    Missing keys: {missing_keys.missing_keys}")
     
     vae = AutoencoderKL.from_pretrained(args.vae_path).to(device).eval()
     print(f"  ✓ VAE loaded")
@@ -192,9 +219,9 @@ def main():
         alpha_down = F.interpolate(alpha, size=(h, w), mode='bilinear', align_corners=False)  # (N_ref, 1, h, w)
         
         # RGB latent (4ch) + Alpha (1ch) = 5채널
-        ref_latents = torch.cat([z_rgb, alpha_down], dim=1)  # (N_ref, 5, h, w)
-    
-    ref_latents = ref_latents.unsqueeze(0)  # (1, N_ref, 5, h, w)
+        ref_latents = z_rgb    
+
+    ref_latents = ref_latents.unsqueeze(0)  # (1, N_ref, 4, h, w)
     print(f"  Reference latents: {ref_latents.shape}")
     print(f"ref_latents mean: {ref_latents.mean():.4f}, std: {ref_latents.std():.4f}")
     print(f"ref_latents[:, :, :4] (RGB) std: {ref_latents[:, :, :4].std():.4f}")  # RGB
@@ -216,29 +243,10 @@ def main():
         print("\n[4/5] Encoding text...")
         args.prompt = input("Enter prompt (or 'exit' to quit): ")
         
-        caption_embs, _ = t5.get_text_embeddings([args.prompt])
+        caption_embs, mask = t5.get_text_embeddings([args.prompt])
         y = caption_embs.float()[:, None]  # (1, 1, L, 4096)
+
         print(f"  Text embedding: {y.shape}")
-
-        # 다른 noise로 테스트
-        test_x1 = torch.randn(1, 5, 8, 8, device=device)
-        test_x2 = torch.randn(1, 5, 8, 8, device=device) * 2  # 다른 스케일
-        test_t = torch.tensor([500], device=device)
-
-        out1 = model(test_x1, test_t, y, ref_latents, mask=None)
-        out2 = model(test_x2, test_t, y, ref_latents, mask=None)
-
-        print(f"out1 mean: {out1.mean():.4f}, std: {out1.std():.4f}")
-        print(f"out2 mean: {out2.mean():.4f}, std: {out2.std():.4f}")
-        print(f"Difference: {(out1 - out2).abs().mean():.4f}")
-
-        with torch.no_grad():
-            test_x = torch.randn(1, 5, latent_size, latent_size, device=device)
-            test_t = torch.tensor([500], device=device)
-            test_out = model(test_x, test_t, y, ref_latents, mask=None)
-            print(f"Model output shape: {test_out.shape}")
-            print(f"Model output mean: {test_out.mean():.4f}, std: {test_out.std():.4f}")
-
         
         # ============================================
         # Generate Target Layer
@@ -249,49 +257,25 @@ def main():
         
         z = sampler.sample(
             model=model,
-            shape=(1, 5, latent_size, latent_size),
+            shape=(1, 4, latent_size, latent_size),
             y=y,
+            y_mask=mask,
             x_ref=ref_latents,
             cfg_scale=args.cfg_scale,
             steps=args.steps,
             device=device,
         )
-        print(f"Final z shape: {z.shape}")
-        print(f"Final z mean: {z.mean():.4f}, std: {z.std():.4f}")
-        print(f"z RGB (ch 0-3) mean: {z[:, :4].mean():.4f}, std: {z[:, :4].std():.4f}")
-        print(f"z Alpha (ch 4) mean: {z[:, 4:].mean():.4f}, std: {z[:, 4:].std():.4f}")
-        for i in range(5):
-            print(f"z channel {i}: mean={z[0,i].mean():.4f}, std={z[0,i].std():.4f}, min={z[0,i].min():.4f}, max={z[0,i].max():.4f}")
-        for i in range(4):
-            print(f"ref channel {i}: mean={ref_latents[0, 0, i].mean():.4f}, std={ref_latents[0, 0, i].std():.4f}")
+
 
         # ============================================
         # Decode & Save
         # ============================================
-        print("\nDecoding and saving...")
-        with torch.no_grad():
-            test_z = vae.encode(ref_images[:1, :3]).latent_dist.mode()  # 첫번째 ref, RGB만
-            print(f"Encoded z std: {test_z.std():.4f}")
-            
-            test_recon = vae.decode(test_z).sample
-            print(f"Reconstructed mean: {test_recon.mean():.4f}, std: {test_recon.std():.4f}")
 
         with torch.no_grad():
-            # z는 5채널 (4 RGB latent + 1 Alpha)
-            z_rgb = z[:, :4, :, :]  # (1, 4, h, w)
-            z_alpha = z[:, 4:5, :, :]  # (1, 1, h, w)
-            
-            # RGB 디코딩
-            generated_rgb = vae.decode(z_rgb / 0.18215).sample  # (1, 3, H, W)
-            print(f"generated_rgb mean: {generated_rgb.mean():.4f}, std: {generated_rgb.std():.4f}")
-            print(f"generated_rgb min: {generated_rgb.min():.4f}, max: {generated_rgb.max():.4f}")
-
-            # Alpha 업샘플링
-            H, W = generated_rgb.shape[-2:]
-            generated_alpha = F.interpolate(z_alpha, size=(H, W), mode='bilinear', align_corners=False)
+            generated_rgb = vae.decode(z / 0.18215).sample
             
             # RGBA 합치기
-            generated_img = torch.cat([generated_rgb, generated_alpha], dim=1)  # (1, 4, H, W)        
+            generated_img = generated_rgb
         os.makedirs(os.path.dirname(args.output) or '.', exist_ok=True)
         
         # Save generated layer
