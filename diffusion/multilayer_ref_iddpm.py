@@ -72,24 +72,24 @@ class ReferenceIDDPM:
             t = timesteps[i]
             t_next = timesteps[i + 1]
             t_batch = t.expand(shape[0])
-            
-            # CFG: conditional + unconditional
-            x_in = torch.cat([x, x], dim=0)
-            t_in = torch.cat([t_batch, t_batch], dim=0)
-            y_in = torch.cat([y, null_y.expand(y.shape[0], -1, -1, -1)], dim=0)
-            x_ref_in = torch.cat([x_ref, x_ref], dim=0)
-            
-            # Model forward
-            model_output = model(
-                x_target=x_in,
-                timestep=t_in,
-                y=y_in,
-                x_ref=x_ref_in,
+
+            # CFG: conditional (text + ref) vs unconditional (no text, no ref)
+            # Conditional: text + reference
+            out_cond = model(
+                x_target=x,
+                timestep=t_batch,
+                y=y,
+                x_ref=x_ref,
                 mask=None,
             )
-            
-            # Split and apply CFG
-            out_cond, out_uncond = model_output.chunk(2, dim=0)
+
+            # Unconditional: no text, no reference
+            out_uncond = model.forward_without_ref(
+                x_target=x,
+                timestep=t_batch,
+                y=null_y.expand(y.shape[0], -1, -1, -1),
+                mask=None,
+            )
             
             in_channels = shape[1]
             if out_cond.shape[1] == 2 * in_channels:
