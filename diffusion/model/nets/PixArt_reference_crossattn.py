@@ -95,11 +95,11 @@ class TimestepEmbedder(nn.Module):
 class CaptionEmbedder(nn.Module):
     def __init__(self, in_channels, hidden_size, uncond_prob, act_layer=nn.GELU, token_num=120):
         super().__init__()
-        self.y_proj = nn.Sequential(
-            nn.Linear(in_channels, hidden_size, bias=True),
-            act_layer(),
-            nn.Linear(hidden_size, hidden_size, bias=True),
-        )
+        self.y_proj = nn.Module()
+        self.y_proj.fc1 = nn.Linear(in_channels, hidden_size, bias=True)
+        self.y_proj.act = act_layer()
+        self.y_proj.fc2 = nn.Linear(hidden_size, hidden_size, bias=True)
+
         self.register_buffer("y_embedding", nn.Parameter(torch.randn(token_num, in_channels) / in_channels ** 0.5))
         self.uncond_prob = uncond_prob
 
@@ -114,7 +114,9 @@ class CaptionEmbedder(nn.Module):
     def forward(self, caption, train, force_drop_ids=None):
         if train:
             caption = self.token_drop(caption, force_drop_ids)
-        caption = self.y_proj(caption)
+        caption = self.y_proj.fc1(caption)
+        caption = self.y_proj.act(caption)
+        caption = self.y_proj.fc2(caption)
         return caption
 
 
@@ -498,8 +500,8 @@ class ReferencePixArtCrossAttn(nn.Module):
         nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
         nn.init.normal_(self.t_block[1].weight, std=0.02)
 
-        nn.init.normal_(self.y_embedder.y_proj[0].weight, std=0.02)
-        nn.init.normal_(self.y_embedder.y_proj[2].weight, std=0.02)
+        nn.init.normal_(self.y_embedder.y_proj.fc1.weight, std=0.02)
+        nn.init.normal_(self.y_embedder.y_proj.fc2.weight, std=0.02)
 
         for block in self.blocks:
             nn.init.constant_(block.cross_attn.proj.weight, 0)
@@ -570,8 +572,7 @@ class ReferencePixArtCrossAttn(nn.Module):
                 x = block(x, cond_tokens, t0)
 
         # 7. Final layer
-        t_final = t0[:, :2*D].reshape(B, 2, D)
-        x = self.final_layer(x, t_final)
+        x = self.final_layer(x, t)
 
         # 8. Unpatchify
         x = self.unpatchify(x)
@@ -606,8 +607,7 @@ class ReferencePixArtCrossAttn(nn.Module):
             for block in self.blocks:
                 x = block(x, cond_tokens, t0)
 
-        t_final = t0[:, :2*D].reshape(B, 2, D)
-        x = self.final_layer(x, t_final)
+        x = self.final_layer(x, t)
         x = self.unpatchify(x)
 
         return x
