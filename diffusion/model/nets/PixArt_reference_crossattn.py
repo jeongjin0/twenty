@@ -202,7 +202,7 @@ class T2IFinalLayer(nn.Module):
         self.scale_shift_table = nn.Parameter(torch.randn(2, hidden_size) / hidden_size ** 0.5)
 
     def forward(self, x, t):
-        shift, scale = (self.scale_shift_table[None] + t.reshape(-1, 2, x.shape[-1])).chunk(2, dim=1)
+        shift, scale = (self.scale_shift_table[None] + t[:, None]).chunk(2, dim=1)
         x = t2i_modulate(self.norm_final(x), shift, scale)
         x = self.linear(x)
         return x
