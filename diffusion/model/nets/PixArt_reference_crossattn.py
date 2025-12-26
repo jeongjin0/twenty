@@ -18,14 +18,21 @@ from timm.models.layers import DropPath
 from timm.models.vision_transformer import PatchEmbed, Mlp
 from typing import Optional, List, Tuple
 
+# Import from PixArt_blocks for consistency and bug-free implementations
+from diffusion.model.nets.PixArt_blocks import (
+    t2i_modulate,
+    CaptionEmbedder,
+    WindowAttention,
+    MultiHeadCrossAttention,
+    T2IFinalLayer,
+    TimestepEmbedder,
+    PixArtBlock
+)
+
 
 #################################################################################
 #                              Utility Functions                                #
 #################################################################################
-
-def t2i_modulate(x, shift, scale):
-    return x * (1 + scale) + shift
-
 
 def get_2d_sincos_pos_embed(embed_dim, grid_size, cls_token=False, extra_tokens=0, lewei_scale=1.0, base_size=16):
     if isinstance(grid_size, int):
@@ -58,189 +65,6 @@ def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
     emb_sin = np.sin(out)
     emb_cos = np.cos(out)
     return np.concatenate([emb_sin, emb_cos], axis=1)
-
-
-#################################################################################
-#                              Core Components                                  #
-#################################################################################
-
-class TimestepEmbedder(nn.Module):
-    def __init__(self, hidden_size, frequency_embedding_size=256):
-        super().__init__()
-        self.mlp = nn.Sequential(
-            nn.Linear(frequency_embedding_size, hidden_size, bias=True),
-            nn.SiLU(),
-            nn.Linear(hidden_size, hidden_size, bias=True),
-        )
-        self.frequency_embedding_size = frequency_embedding_size
-
-    @staticmethod
-    def timestep_embedding(t, dim, max_period=10000):
-        half = dim // 2
-        freqs = torch.exp(
-            -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half
-        ).to(device=t.device)
-        args = t[:, None].float() * freqs[None]
-        embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
-        if dim % 2:
-            embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
-        return embedding
-
-    def forward(self, t):
-        t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
-        t_emb = self.mlp(t_freq)
-        return t_emb
-
-
-class CaptionEmbedder(nn.Module):
-    def __init__(self, in_channels, hidden_size, uncond_prob, act_layer=nn.GELU, token_num=120):
-        super().__init__()
-        self.y_proj = nn.Module()
-        self.y_proj.fc1 = nn.Linear(in_channels, hidden_size, bias=True)
-        self.y_proj.act = act_layer()
-        self.y_proj.fc2 = nn.Linear(hidden_size, hidden_size, bias=True)
-
-        self.register_buffer("y_embedding", nn.Parameter(torch.randn(token_num, in_channels) / in_channels ** 0.5))
-        self.uncond_prob = uncond_prob
-
-    def token_drop(self, caption, force_drop_ids=None):
-        if force_drop_ids is None:
-            drop_ids = torch.rand(caption.shape[0], device=caption.device) < self.uncond_prob
-        else:
-            drop_ids = force_drop_ids == 1
-        caption = torch.where(drop_ids[:, None, None, None], self.y_embedding.unsqueeze(0).unsqueeze(0), caption)
-        return caption
-
-    def forward(self, caption, train, force_drop_ids=None):
-        if train:
-            caption = self.token_drop(caption, force_drop_ids)
-        caption = self.y_proj.fc1(caption)
-        caption = self.y_proj.act(caption)
-        caption = self.y_proj.fc2(caption)
-        return caption
-
-
-class MultiHeadCrossAttention(nn.Module):
-    def __init__(self, d_model, num_heads, attn_drop=0., proj_drop=0., **kwargs):
-        super().__init__()
-        self.num_heads = num_heads
-        self.head_dim = d_model // num_heads
-        self.scale = self.head_dim ** -0.5
-
-        self.q_linear = nn.Linear(d_model, d_model)
-        self.kv_linear = nn.Linear(d_model, d_model * 2)
-        self.attn_drop = nn.Dropout(attn_drop)
-        self.proj = nn.Linear(d_model, d_model)
-        self.proj_drop = nn.Dropout(proj_drop)
-
-    def forward(self, x, cond, mask=None):
-        B, N, C = x.shape
-
-        q = self.q_linear(x).reshape(B, N, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
-
-        if cond.shape[0] == 1 and B > 1:
-            kv = self.kv_linear(cond).reshape(1, -1, 2, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
-            k, v = kv[0], kv[1]
-            k = k.expand(B, -1, -1, -1)
-            v = v.expand(B, -1, -1, -1)
-        else:
-            kv = self.kv_linear(cond).reshape(B, -1, 2, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
-            k, v = kv[0], kv[1]
-
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        
-        if mask is not None:
-            attn = attn.masked_fill(mask.unsqueeze(1).unsqueeze(2) == 0, float('-inf'))
-        
-        attn = attn.softmax(dim=-1)
-        attn = self.attn_drop(attn)
-
-        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
-        x = self.proj(x)
-        x = self.proj_drop(x)
-        return x
-
-
-class WindowAttention(nn.Module):
-    def __init__(self, dim, num_heads, qkv_bias=True, attn_drop=0., proj_drop=0., 
-                 input_size=None, use_rel_pos=False, **kwargs):
-        super().__init__()
-        self.num_heads = num_heads
-        self.head_dim = dim // num_heads
-        self.scale = self.head_dim ** -0.5
-
-        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
-        self.attn_drop = nn.Dropout(attn_drop)
-        self.proj = nn.Linear(dim, dim)
-        self.proj_drop = nn.Dropout(proj_drop)
-        
-        self.use_rel_pos = use_rel_pos
-        if use_rel_pos and input_size is not None:
-            self.rel_pos_h = nn.Parameter(torch.zeros(2 * input_size[0] - 1, self.head_dim))
-            self.rel_pos_w = nn.Parameter(torch.zeros(2 * input_size[1] - 1, self.head_dim))
-
-    def forward(self, x):
-        B, N, C = x.shape
-        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]
-
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn = attn.softmax(dim=-1)
-        attn = self.attn_drop(attn)
-
-        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
-        x = self.proj(x)
-        x = self.proj_drop(x)
-        return x
-
-
-class T2IFinalLayer(nn.Module):
-    def __init__(self, hidden_size, patch_size, out_channels):
-        super().__init__()
-        self.norm_final = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        self.linear = nn.Linear(hidden_size, patch_size * patch_size * out_channels, bias=True)
-        self.scale_shift_table = nn.Parameter(torch.randn(2, hidden_size) / hidden_size ** 0.5)
-
-    def forward(self, x, t):
-        shift, scale = (self.scale_shift_table[None] + t[:, None]).chunk(2, dim=1)
-        x = t2i_modulate(self.norm_final(x), shift, scale)
-        x = self.linear(x)
-        return x
-
-
-class PixArtBlock(nn.Module):
-    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, drop_path=0., 
-                 window_size=0, input_size=None, use_rel_pos=False, **block_kwargs):
-        super().__init__()
-        self.hidden_size = hidden_size
-        self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        self.attn = WindowAttention(
-            hidden_size, num_heads=num_heads, qkv_bias=True,
-            input_size=input_size if window_size == 0 else (window_size, window_size),
-            use_rel_pos=use_rel_pos, **block_kwargs
-        )
-        self.cross_attn = MultiHeadCrossAttention(hidden_size, num_heads, **block_kwargs)
-        self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        approx_gelu = lambda: nn.GELU(approximate="tanh")
-        self.mlp = Mlp(in_features=hidden_size, hidden_features=int(hidden_size * mlp_ratio), 
-                       act_layer=approx_gelu, drop=0)
-        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
-        self.window_size = window_size
-        self.scale_shift_table = nn.Parameter(torch.randn(6, hidden_size) / hidden_size ** 0.5)
-
-    def forward(self, x, y, t, mask=None, **kwargs):
-        B, N, C = x.shape
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = \
-            (self.scale_shift_table[None] + t.reshape(B, 6, -1)).chunk(6, dim=1)
-        
-        x = x + self.drop_path(gate_msa * self.attn(
-            t2i_modulate(self.norm1(x), shift_msa, scale_msa)
-        ).reshape(B, N, C))
-        x = x + self.cross_attn(x, y, mask)
-        x = x + self.drop_path(gate_mlp * self.mlp(
-            t2i_modulate(self.norm2(x), shift_mlp, scale_mlp)
-        ))
-        return x
 
 
 #################################################################################
