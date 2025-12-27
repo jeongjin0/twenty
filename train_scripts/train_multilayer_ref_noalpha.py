@@ -454,6 +454,7 @@ def parse_args():
     parser.add_argument('--local_rank', type=int, default=-1)
     parser.add_argument('--debug', action='store_true')
     parser.add_argument('--use_ref', default=True)
+    parser.add_argument("--model_type", default="adaln", type=str)
 
     parser.add_argument(
         "--report_to",
@@ -475,21 +476,21 @@ def parse_args():
 if __name__ == '__main__':
     args = parse_args()
     config = read_config(args.config)
-    
-    #print args
-    if accelerator.is_main_process:
-        print("Arguments:")
-        for k, v in vars(args).items():
-            print(f"{k}: {v}")
 
-        if args.use_ref:
-            print("✓ Running with reference images!")
-        else:
-            print("⚠ Running without reference images!")
+    print("Arguments:")
+    for k, v in vars(args).items():
+        print(f"{k}: {v}")
 
 
     if args.use_ref == 'False' or args.use_ref == 'false':
         args.use_ref = False
+
+    if args.use_ref:
+        print("✓ Running with reference images!")
+    else:
+        print("⚠ Running without reference images!")
+
+
         
     if args.work_dir is not None:
         config.work_dir = args.work_dir
@@ -519,7 +520,8 @@ if __name__ == '__main__':
     
     ddp_kwargs = DistributedDataParallelKwargs(
         broadcast_buffers=False,
-        gradient_as_bucket_view=False  # 명시적으로 False
+        gradient_as_bucket_view=False,  # 명시적으로 False
+        find_unused_parameters=True
     )
 
     if config.use_fsdp:
@@ -590,7 +592,7 @@ if __name__ == '__main__':
     # Use 'crossattn' for better prompt alignment
     # - crossattn: Text and reference both use cross-attention (balanced, preserves text-to-image ability)
     # - adaln: Reference uses AdaLN, text uses cross-attention (reference can dominate)
-    model_type = 'crossattn'
+    model_type = args.model_type
     logger.info(f"Building MultiLayerPixArt model of type: {model_type}")
 
     if model_type == 'adaln':

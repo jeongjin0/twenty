@@ -39,7 +39,6 @@ class SimpleDDIMSampler:
     def sample(self, model, shape, y, y_mask, x_ref, cfg_scale=4.5, steps=20, device='cuda'):
         """DDIM Sampling with reference"""
         self.alphas_cumprod = self.alphas_cumprod.to(device)
-        print("model use_ref:", model.use_ref)
 
         
         x = torch.randn(shape, device=device)
@@ -63,10 +62,10 @@ class SimpleDDIMSampler:
             null_mask = torch.ones(1, y_mask.shape[1], device=y_mask.device, dtype=y_mask.dtype)
             mask_in = torch.cat([y_mask, null_mask], dim=0)
 
-            try:
-                noise_pred = model(x_in, t_in, y_in, x_ref_in, mask=mask_in)
-            except:
-                noise_pred = model(x_in, t_in, y_in, mask=mask_in)
+            # try:
+            noise_pred = model(x_in, t_in, y_in, x_ref_in, mask=mask_in)
+            # except:
+            #     noise_pred = model(x_in, t_in, y_in, mask=mask_in)
 
             
             noise_pred_cond, noise_pred_uncond = noise_pred.chunk(2, dim=0)
@@ -154,6 +153,18 @@ def main():
     print("model use_ref:", model.use_ref)
     print("args use ref:", args.use_ref)
 
+
+    from diffusion.model.nets.PixArt_reference_crossattn import ReferencePixArtCrossAttn_XL_2
+    model = ReferencePixArtCrossAttn_XL_2(
+        input_size=latent_size,
+        in_channels=4,
+        max_ref_layers=7,
+        ref_encoder_depth=4,
+        ref_compression_ratio=4, 
+        caption_channels=4096,
+        model_max_length=120,
+        pred_sigma=True,
+    ).to(device).eval()
 
     # from diffusion.model.nets.PixArt import PixArt_XL_2
 
