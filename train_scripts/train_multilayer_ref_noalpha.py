@@ -153,7 +153,17 @@ def encode_reference_vae_rgb_batch(vae, layers, num_layers, target_indices, scal
                 z_ref_merged = [z_ref_b[i] for i in keep_indices]
                 z_ref_merged.append(merged)
 
+                # Stack merged references
                 z_ref_b = torch.stack(z_ref_merged, dim=0)
+
+                # Add zero padding to maintain original size for batching
+                # Original size: len(ref_indices), Current size: len(z_ref_merged)
+                original_size = len(ref_indices)
+                current_size = z_ref_b.shape[0]
+                if current_size < original_size:
+                    pad_size = original_size - current_size
+                    pad = torch.zeros(pad_size, C_latent, h, w, device=device, dtype=z_ref_b.dtype)
+                    z_ref_b = torch.cat([z_ref_b, pad], dim=0)
 
         z_ref_list.append(z_ref_b)
 
