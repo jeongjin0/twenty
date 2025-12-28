@@ -7,7 +7,7 @@ from tqdm import tqdm
 class ReferenceIDDPM:
     def __init__(self, iddpm):
         self.iddpm = iddpm
-        self.num_timesteps = 100
+        self.num_timesteps = getattr(iddpm, 'original_num_steps', 1000)
     
     def training_losses(self, model, x, t, model_kwargs=None):
         """x: (B, C, H, W) 타겟 레이어"""
