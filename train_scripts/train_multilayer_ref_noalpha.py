@@ -86,41 +86,80 @@ def reset_memory_stats():
     torch.cuda.empty_cache()
 
 
-def encode_reference_vae_rgb_batch(vae, layers, num_layers, target_indices, scale_factor=0.18215):
+def encode_reference_vae_rgb_batch(vae, layers, num_layers, target_indices, scale_factor=0.18215,
+                                   shuffle_ref=True, merge_augmentation_prob=0.0):
     """
     Alpha 없이 RGB만 처리하는 VAE 인코딩
-    
+
+    Args:
+        vae: VAE model
+        layers: (B, N, C, H, W) input layers
+        num_layers: (B,) actual number of layers per sample
+        target_indices: List[int] target layer index for each sample
+        scale_factor: VAE scaling factor
+        shuffle_ref: If True, shuffle reference order
+        merge_augmentation_prob: Probability of merging two reference layers (0.0-1.0)
+
     Returns:
         z_target: (B, 4, h, w)
         z_ref: (B, max_ref, 4, h, w)
     """
     B, N, C, H, W = layers.shape
     device = layers.device
-    
+
     # RGB만 VAE encoding
     rgb = layers[:, :, :3, :, :]  # (B, N, 3, H, W)
-    
+
     rgb_flat = rgb.reshape(B * N, 3, H, W)
     z_rgb_flat = vae.encode(rgb_flat).latent_dist.mode() * scale_factor
-    
+
     _, C_latent, h, w = z_rgb_flat.shape  # C_latent = 4
     z_all = z_rgb_flat.reshape(B, N, C_latent, h, w)  # (B, N, 4, h, w)
-    
+
     # Batch별로 target/reference 분리
     z_target_list = []
     z_ref_list = []
-    
+
     for b in range(B):
         t_idx = target_indices[b]
         z_target_list.append(z_all[b, t_idx])  # (4, h, w)
-        
+
+        # Reference indices (exclude target)
         ref_indices = [i for i in range(N) if i != t_idx]
+
+        # Shuffle reference order
+        if shuffle_ref:
+            import random
+            random.shuffle(ref_indices)
+
         z_ref_b = z_all[b, ref_indices]  # (N-1, 4, h, w)
+
+        # Merge augmentation: combine two random reference layers
+        if merge_augmentation_prob > 0 and len(ref_indices) >= 2:
+            if torch.rand(1).item() < merge_augmentation_prob:
+                # Pick two random indices to merge
+                merge_idx1 = torch.randint(0, len(ref_indices), (1,)).item()
+                merge_idx2 = torch.randint(0, len(ref_indices), (1,)).item()
+
+                # Make sure they're different
+                while merge_idx2 == merge_idx1:
+                    merge_idx2 = torch.randint(0, len(ref_indices), (1,)).item()
+
+                # Merge by averaging (or you could use other strategies)
+                merged = (z_ref_b[merge_idx1] + z_ref_b[merge_idx2]) / 2.0
+
+                # Remove the two layers and add merged one
+                keep_indices = [i for i in range(len(ref_indices)) if i not in [merge_idx1, merge_idx2]]
+                z_ref_merged = [z_ref_b[i] for i in keep_indices]
+                z_ref_merged.append(merged)
+
+                z_ref_b = torch.stack(z_ref_merged, dim=0)
+
         z_ref_list.append(z_ref_b)
-    
+
     z_target = torch.stack(z_target_list, dim=0)  # (B, 4, h, w)
-    z_ref = torch.stack(z_ref_list, dim=0)  # (B, N-1, 4, h, w)
-    
+    z_ref = torch.stack(z_ref_list, dim=0)  # (B, N-1 or less, 4, h, w)
+
     return z_target, z_ref
 
 
@@ -265,11 +304,19 @@ def train():
 
             with torch.no_grad():
                 # 각 샘플마다 유효 레이어 범위 내에서 랜덤 target 선택
-                target_indices = [torch.randint(0, num_layers[b].item(), (1,)).item() for b in range(B)]
+                # 0번 index는 background이므로 제외 (1부터 선택)
+                target_indices = [torch.randint(1, num_layers[b].item(), (1,)).item() for b in range(B)]
+
+                # Augmentation settings
+                shuffle_ref = getattr(config, 'shuffle_ref', True)
+                merge_augmentation_prob = getattr(config, 'merge_augmentation_prob', 0.0)
+
                 z_target, z_ref = encode_reference_vae_rgb_batch(
                     vae, layers, num_layers,
                     target_indices=target_indices,
-                    scale_factor=config.scale_factor
+                    scale_factor=config.scale_factor,
+                    shuffle_ref=shuffle_ref,
+                    merge_augmentation_prob=merge_augmentation_prob
                 )                
 
             with torch.no_grad():
