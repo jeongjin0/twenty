@@ -135,7 +135,18 @@ def encode_reference_vae_rgba_batch(vae, layers, num_layers, target_indices, sca
                 z_ref_merged = [z_ref_b[i] for i in keep_indices]
                 z_ref_merged.append(merged)
 
+                # Stack merged references
                 z_ref_b = torch.stack(z_ref_merged, dim=0)
+
+                # Add zero padding to maintain original size for batching
+                # Original size: len(ref_indices), Current size: len(z_ref_merged)
+                original_size = len(ref_indices)
+                current_size = z_ref_b.shape[0]
+                if current_size < original_size:
+                    pad_size = original_size - current_size
+                    # Note: RGBA version has 5 channels (4 RGB + 1 alpha)
+                    pad = torch.zeros(pad_size, 5, h, w, device=device, dtype=z_ref_b.dtype)
+                    z_ref_b = torch.cat([z_ref_b, pad], dim=0)
 
         z_ref_list.append(z_ref_b)
     
