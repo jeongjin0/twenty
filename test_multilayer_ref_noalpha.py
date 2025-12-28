@@ -179,7 +179,7 @@ def generate_with_references(
         z_ref = z_ref.unsqueeze(0)  # (1, N, 4, h, w)
 
         # Sample
-        _, _, h, w = z_ref.shape[2:]
+        h, w = z_ref.shape[-2:]
         z_gen = diffusion.ddim_sample(
             model=model,
             shape=(1, 4, h, w),
