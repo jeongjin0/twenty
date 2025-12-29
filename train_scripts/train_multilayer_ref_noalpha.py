@@ -544,8 +544,6 @@ if __name__ == '__main__':
     args = parse_args()
     config = read_config(args.config)
     
-    #print args
-    if accelerator.is_main_process:
         print("Arguments:")
         for k, v in vars(args).items():
             print(f"{k}: {v}")
