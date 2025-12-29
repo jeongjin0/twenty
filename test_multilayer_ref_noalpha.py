@@ -198,6 +198,9 @@ def generate_with_references(
         # z_ref: (N, 4, h, w)
         z_ref = z_ref.unsqueeze(0)  # (1, N, 4, h, w)
 
+        # Debug: print reference latent stats
+        print(f"    z_ref shape: {z_ref.shape}, mean: {z_ref.mean().item():.3f}, std: {z_ref.std().item():.3f}")
+
         # Sample
         h, w = z_ref.shape[-2:]
         z_gen = diffusion.ddim_sample(
@@ -231,6 +234,7 @@ def main():
     parser.add_argument('--steps', type=int, default=20, help='Sampling steps')
     parser.add_argument('--num_refs', type=int, default=3, help='Number of reference images per set')
     parser.add_argument('--num_samples', type=int, default=4, help='Number of samples per reference set')
+    parser.add_argument('--fixed_seed', action='store_true', help='Use fixed seed across all reference sets to test reference influence')
     parser.add_argument('--device', type=str, default='cuda', help='Device')
 
     args = parser.parse_args()
@@ -317,6 +321,7 @@ def main():
         )
 
         print(f"  Reference shape: {ref_images.shape}")
+        print(f"  Reference image stats: mean={ref_images.mean().item():.3f}, std={ref_images.std().item():.3f}")
         print(f"  Reference captions:")
         for i, cap in enumerate(ref_captions):
             print(f"    [Layer {layer_indices[i]}] {cap[:80]}...")  # Print first 80 chars of each caption
@@ -329,7 +334,12 @@ def main():
             print(f"  Generating sample {sample_idx + 1}/{args.num_samples}...")
 
             # Set different seed for each sample and each reference set
-            seed = 42 + set_idx * 1000 + sample_idx
+            if args.fixed_seed:
+                # Use same seed across all reference sets to test reference influence
+                seed = 42 + sample_idx
+            else:
+                # Use different seeds for each reference set
+                seed = 42 + set_idx * 1000 + sample_idx
             torch.manual_seed(seed)
 
             img_gen, img_refs_tmp = generate_with_references(
