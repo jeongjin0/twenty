@@ -230,12 +230,16 @@ def main():
     parser.add_argument('--cfg_scale', type=float, default=4.5, help='CFG scale')
     parser.add_argument('--steps', type=int, default=20, help='Sampling steps')
     parser.add_argument('--num_refs', type=int, default=3, help='Number of reference images per set')
+    parser.add_argument('--num_samples', type=int, default=4, help='Number of samples per reference set')
     parser.add_argument('--device', type=str, default='cuda', help='Device')
 
     args = parser.parse_args()
 
-    # Create output directory
-    os.makedirs(args.output_dir, exist_ok=True)
+    # Create output directory based on prompt
+    import re
+    prompt_folder = re.sub(r'[^\w\s-]', '', args.prompt).strip().replace(' ', '_')[:50]
+    output_dir = os.path.join(args.output_dir, prompt_folder)
+    os.makedirs(output_dir, exist_ok=True)
 
     # ============================================
     # TODO: Fill in your reference image sets!
@@ -259,7 +263,8 @@ def main():
     print(f"Prompt: '{args.prompt}'")
     print(f"CFG scale: {args.cfg_scale}")
     print(f"Steps: {args.steps}")
-    print(f"Output dir: {args.output_dir}")
+    print(f"Num samples per set: {args.num_samples}")
+    print(f"Output dir: {output_dir}")
     print("="*60)
 
     device = torch.device(args.device)
@@ -316,41 +321,56 @@ def main():
         for i, cap in enumerate(ref_captions):
             print(f"    [Layer {layer_indices[i]}] {cap[:80]}...")  # Print first 80 chars of each caption
 
-        # Generate
-        img_gen, img_refs = generate_with_references(
-            model=model,
-            vae=vae,
-            text_encoder=text_encoder,
-            diffusion=diffusion,
-            prompt=args.prompt,
-            ref_images=ref_images,
-            device=device,
-            cfg_scale=args.cfg_scale,
-            steps=args.steps,
-            scale_factor=config.scale_factor
-        )
+        # Generate multiple samples with different seeds
+        all_samples = []
+        img_refs = None
 
-        # Save individual result: [ref1, ref2, ref3, ..., generated]
+        for sample_idx in range(args.num_samples):
+            print(f"  Generating sample {sample_idx + 1}/{args.num_samples}...")
+
+            # Set different seed for each sample
+            torch.manual_seed(42 + sample_idx)
+
+            img_gen, img_refs_tmp = generate_with_references(
+                model=model,
+                vae=vae,
+                text_encoder=text_encoder,
+                diffusion=diffusion,
+                prompt=args.prompt,
+                ref_images=ref_images,
+                device=device,
+                cfg_scale=args.cfg_scale,
+                steps=args.steps,
+                scale_factor=config.scale_factor
+            )
+
+            all_samples.append(img_gen)
+            if img_refs is None:
+                img_refs = img_refs_tmp
+
+        # Save result: [ref1, ref2, ref3, ..., sample1, sample2, sample3, sample4]
         num_refs_loaded = img_refs.shape[0]
-        images = [img_refs[i] for i in range(num_refs_loaded)] + [img_gen]
-        grid = make_grid(images, nrow=num_refs_loaded + 1, normalize=True, value_range=(-1, 1))
+        images = [img_refs[i] for i in range(num_refs_loaded)] + all_samples
+        grid = make_grid(images, nrow=num_refs_loaded + args.num_samples, normalize=True, value_range=(-1, 1))
 
-        save_path = os.path.join(args.output_dir, f'{set_name}.png')
+        save_path = os.path.join(output_dir, f'{set_name}.png')
         save_image(grid, save_path)
         print(f"  Saved to: {save_path}")
 
-        all_generated.append(img_gen)
+        all_generated.extend(all_samples)
 
     # Save comparison: all generated images together
     if len(all_generated) > 0:
-        comparison_grid = make_grid(all_generated, nrow=len(all_generated), normalize=True, value_range=(-1, 1))
-        comparison_path = os.path.join(args.output_dir, 'all_generated_comparison.png')
+        # Limit number of images per row for better visualization
+        nrow = min(args.num_samples, 8)
+        comparison_grid = make_grid(all_generated, nrow=nrow, normalize=True, value_range=(-1, 1))
+        comparison_path = os.path.join(output_dir, 'all_generated_comparison.png')
         save_image(comparison_grid, comparison_path)
         print(f"\n[Comparison] All generated images saved to: {comparison_path}")
 
     print("\n" + "="*60)
     print("Test completed!")
-    print(f"Results saved in: {args.output_dir}")
+    print(f"Results saved in: {output_dir}")
     print("="*60)
 
 
