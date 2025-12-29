@@ -176,11 +176,26 @@ def generate_with_references(
         cfg_scale: Classifier-free guidance scale
         steps: Number of sampling steps
         scale_factor: VAE scale factor
+        debug: Print debug information
 
     Returns:
         generated_image: (3, H, W) in pixel space
         ref_images_decoded: (N, 3, H, W) in pixel space
     """
+    # Hook to capture intermediate values
+    ref_tokens_captured = {}
+    cond_tokens_captured = {}
+
+    def ref_encoder_hook(module, input, output):
+        ref_tokens_captured['output'] = output.detach()
+        if debug:
+            print(f"    [DEBUG] ref_encoder output shape: {output.shape}, mean: {output.mean().item():.3f}, std: {output.std().item():.3f}")
+
+    # Register hook if model has ref_encoder
+    hook_handle = None
+    if hasattr(model, 'ref_encoder'):
+        hook_handle = model.ref_encoder.register_forward_hook(ref_encoder_hook)
+
     with torch.no_grad():
         # Encode text
         caption_embs, emb_masks = text_encoder.get_text_embeddings([prompt])
@@ -224,6 +239,15 @@ def generate_with_references(
         # Decode references
         z_ref_flat = z_ref.squeeze(0)  # (N, 4, h, w)
         img_refs = vae.decode(z_ref_flat / scale_factor).sample  # (N, 3, H, W)
+
+    # Remove hook
+    if hook_handle is not None:
+        hook_handle.remove()
+
+    # Return captured ref_tokens for analysis if debug
+    if debug and 'output' in ref_tokens_captured:
+        ref_tokens = ref_tokens_captured['output']
+        print(f"    [DEBUG] Final ref_tokens check: shape={ref_tokens.shape}, mean={ref_tokens.mean().item():.3f}, std={ref_tokens.std().item():.3f}")
 
     return img_gen, img_refs
 
