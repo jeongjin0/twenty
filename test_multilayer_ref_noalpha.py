@@ -104,29 +104,48 @@ def load_vae_and_t5(config, device):
 
 def load_reference_images(dataloader, image_indices, num_refs, device):
     """
-    Load reference images from dataset by image IDs.
+    Load reference images from dataset by image indices.
 
     Args:
         dataloader: MultiLayer dataloader
-        image_indices: List of image IDs to load
+        image_indices: List of dataset indices to load (e.g., [0, 1, 2])
         num_refs: Number of reference layers to use
         device: torch device
 
     Returns:
-        ref_images: (num_refs, 4, H, W) - latent space
+        ref_images: (num_refs, C, H, W) - reference images
+        ref_captions: List[str] - captions for each reference
     """
-    # This is a placeholder - you'll need to implement based on your dataset structure
-    # For now, just return random references from the first batch
+    dataset = dataloader.dataset
 
-    batch = next(iter(dataloader))
-    layers, captions, num_layers, image_ids = batch
-    layers = layers.to(device)
+    # Load images from the specified indices
+    all_ref_images = []
+    all_ref_captions = []
 
-    # Take first sample's layers as references
-    # Shape: (N, 3 or 4, H, W)
-    ref_images = layers[0, :num_refs]  # Take first num_refs layers
+    for idx in image_indices:
+        if idx >= len(dataset):
+            print(f"Warning: Index {idx} is out of bounds (dataset size: {len(dataset)}). Skipping.")
+            continue
 
-    return ref_images, captions[0][:num_refs]
+        # Get data from dataset
+        layers, captions, num_layers, image_id = dataset[idx]
+
+        # Take first layer from this image as one reference
+        # layers: (max_layers, C, H, W)
+        # We use the first actual layer (index 0)
+        ref_image = layers[0]  # (C, H, W)
+        ref_caption = captions[0]
+
+        all_ref_images.append(ref_image)
+        all_ref_captions.append(ref_caption)
+
+    # Stack all references: (num_refs, C, H, W)
+    if len(all_ref_images) == 0:
+        raise ValueError("No valid reference images loaded!")
+
+    ref_images = torch.stack(all_ref_images, dim=0).to(device)
+
+    return ref_images, all_ref_captions
 
 
 def generate_with_references(
@@ -280,18 +299,18 @@ def main():
         print(f"\n[{set_idx+1}/{len(reference_sets)}] Generating with {set_name}...")
         print(f"  Reference indices: {indices}")
 
-        # Load reference images
-        # NOTE: You'll need to implement proper image loading based on indices
-        # For now, we use a placeholder that gets images from dataloader
+        # Load reference images based on the indices
         ref_images, ref_captions = load_reference_images(
             dataloader,
             indices,
-            args.num_refs,
+            len(indices),  # Use the number of indices provided
             device
         )
 
         print(f"  Reference shape: {ref_images.shape}")
-        print(f"  Reference captions: {ref_captions[:2]}...")  # Print first 2
+        print(f"  Reference captions:")
+        for i, cap in enumerate(ref_captions):
+            print(f"    [{i}] {cap[:80]}...")  # Print first 80 chars of each caption
 
         # Generate
         img_gen, img_refs = generate_with_references(
@@ -307,9 +326,10 @@ def main():
             scale_factor=config.scale_factor
         )
 
-        # Save individual result: [ref1, ref2, ref3, generated]
-        images = [img_refs[i] for i in range(args.num_refs)] + [img_gen]
-        grid = make_grid(images, nrow=args.num_refs + 1, normalize=True, value_range=(-1, 1))
+        # Save individual result: [ref1, ref2, ref3, ..., generated]
+        num_refs_loaded = img_refs.shape[0]
+        images = [img_refs[i] for i in range(num_refs_loaded)] + [img_gen]
+        grid = make_grid(images, nrow=num_refs_loaded + 1, normalize=True, value_range=(-1, 1))
 
         save_path = os.path.join(args.output_dir, f'{set_name}.png')
         save_image(grid, save_path)
