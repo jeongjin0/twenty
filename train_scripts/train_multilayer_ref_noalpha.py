@@ -877,9 +877,7 @@ if __name__ == '__main__':
     t5_pretrained = getattr(config, 't5_pretrained', 'google/flan-t5-xxl')
     logger.info(f"Loading T5 from: {t5_pretrained}")
 
-    # Text encoder - CPU에서 실행 (메모리 절약)
-    text_encoder = T5Embedder(device='cpu', local_cache=True, cache_dir=t5_pretrained, torch_dtype=torch.float16)
-    print("[Memory Optimization] T5 text encoder on CPU")
+    text_encoder = T5Embedder(device="cuda", local_cache=True, cache_dir=t5_pretrained, torch_dtype=torch.float16)
     print_gpu_memory("After t5 load")
 
     # ============================================
