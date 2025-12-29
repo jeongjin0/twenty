@@ -543,15 +543,15 @@ def parse_args():
 if __name__ == '__main__':
     args = parse_args()
     config = read_config(args.config)
-    
-        print("Arguments:")
-        for k, v in vars(args).items():
-            print(f"{k}: {v}")
 
-        if args.use_ref:
-            print("✓ Running with reference images!")
-        else:
-            print("⚠ Running without reference images!")
+    print("Arguments:")
+    for k, v in vars(args).items():
+        print(f"{k}: {v}")
+
+    if args.use_ref:
+        print("✓ Running with reference images!")
+    else:
+        print("⚠ Running without reference images!")
 
 
     if args.use_ref == 'False' or args.use_ref == 'false':

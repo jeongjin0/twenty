@@ -45,8 +45,8 @@ text_dropout_prob = 0.0  # 50% 확률로 text를 빈 문자열로 대체
 # Training Settings
 # ============================================
 num_epochs = 100
-train_batch_size = 8  # per GPU
-gradient_accumulation_steps = 2  # effective batch = 8 * 2 * num_gpus
+train_batch_size = 4  # per GPU
+gradient_accumulation_steps = 4  # effective batch = 8 * 2 * num_gpus
 eval_interval = 1000
 
 # Diffusion
