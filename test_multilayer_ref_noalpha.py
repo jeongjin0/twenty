@@ -159,7 +159,8 @@ def generate_with_references(
     device,
     cfg_scale=4.5,
     steps=20,
-    scale_factor=0.18215
+    scale_factor=0.18215,
+    debug=False
 ):
     """
     Generate image with given prompt and references.
@@ -198,8 +199,8 @@ def generate_with_references(
         # z_ref: (N, 4, h, w)
         z_ref = z_ref.unsqueeze(0)  # (1, N, 4, h, w)
 
-        # Debug: print reference latent stats
-        print(f"    z_ref shape: {z_ref.shape}, mean: {z_ref.mean().item():.3f}, std: {z_ref.std().item():.3f}")
+        if debug:
+            print(f"    [DEBUG] z_ref shape: {z_ref.shape}, mean: {z_ref.mean().item():.3f}, std: {z_ref.std().item():.3f}")
 
         # Sample
         h, w = z_ref.shape[-2:]
@@ -215,6 +216,10 @@ def generate_with_references(
 
         # Decode
         img_gen = vae.decode(z_gen / scale_factor).sample[0]  # (3, H, W)
+
+        if debug:
+            print(f"    [DEBUG] z_gen shape: {z_gen.shape}, mean: {z_gen.mean().item():.3f}, std: {z_gen.std().item():.3f}")
+            print(f"    [DEBUG] img_gen shape: {img_gen.shape}, mean: {img_gen.mean().item():.3f}, std: {img_gen.std().item():.3f}")
 
         # Decode references
         z_ref_flat = z_ref.squeeze(0)  # (N, 4, h, w)
@@ -235,6 +240,7 @@ def main():
     parser.add_argument('--num_refs', type=int, default=3, help='Number of reference images per set')
     parser.add_argument('--num_samples', type=int, default=4, help='Number of samples per reference set')
     parser.add_argument('--fixed_seed', action='store_true', help='Use fixed seed across all reference sets to test reference influence')
+    parser.add_argument('--debug', action='store_true', help='Print debug information (stats, shapes, etc.)')
     parser.add_argument('--device', type=str, default='cuda', help='Device')
 
     args = parser.parse_args()
@@ -320,11 +326,14 @@ def main():
             device
         )
 
-        print(f"  Reference shape: {ref_images.shape}")
-        print(f"  Reference image stats: mean={ref_images.mean().item():.3f}, std={ref_images.std().item():.3f}")
-        print(f"  Reference captions:")
-        for i, cap in enumerate(ref_captions):
-            print(f"    [Layer {layer_indices[i]}] {cap[:80]}...")  # Print first 80 chars of each caption
+        if args.debug:
+            print(f"  [DEBUG] Reference shape: {ref_images.shape}")
+            print(f"  [DEBUG] Reference image stats: mean={ref_images.mean().item():.3f}, std={ref_images.std().item():.3f}")
+            print(f"  Reference captions:")
+            for i, cap in enumerate(ref_captions):
+                print(f"    [Layer {layer_indices[i]}] {cap[:80]}...")  # Print first 80 chars of each caption
+        else:
+            print(f"  Loaded {len(ref_captions)} reference layers")
 
         # Generate multiple samples with different seeds
         all_samples = []
@@ -352,7 +361,8 @@ def main():
                 device=device,
                 cfg_scale=args.cfg_scale,
                 steps=args.steps,
-                scale_factor=config.scale_factor
+                scale_factor=config.scale_factor,
+                debug=args.debug
             )
 
             all_samples.append(img_gen)
