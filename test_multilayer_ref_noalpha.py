@@ -236,6 +236,20 @@ def generate_with_references(
                 print(f"    [DEBUG]   output_proj OUTPUT: shape={output.shape}, mean={output.mean().item():.6f}, std={output.std().item():.6f}")
             hook_handles.append(model.ref_encoder.output_proj.register_forward_hook(output_proj_hook))
 
+        # Hook transformer blocks to find where collapse happens
+        if debug and hasattr(model.ref_encoder, 'blocks'):
+            for block_idx, block in enumerate(model.ref_encoder.blocks):
+                if block_idx == 0 or block_idx == len(model.ref_encoder.blocks) - 1:  # First and last block only
+                    def make_block_hook(idx):
+                        def block_hook(module, input, output):
+                            in_tensor = input[0] if isinstance(input, tuple) else input
+                            print(f"    [DEBUG]   transformer_block[{idx}] INPUT: mean={in_tensor.mean().item():.6f}, std={in_tensor.std().item():.6f}")
+                            print(f"    [DEBUG]   transformer_block[{idx}] OUTPUT: mean={output.mean().item():.6f}, std={output.std().item():.6f}")
+                        return block_hook
+                    # Hook the attention layer
+                    if 'attn' in block:
+                        hook_handles.append(block['attn'].register_forward_hook(make_block_hook(block_idx)))
+
     with torch.no_grad():
         # Encode text
         caption_embs, emb_masks = text_encoder.get_text_embeddings([prompt])
