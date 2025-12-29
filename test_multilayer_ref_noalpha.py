@@ -80,6 +80,25 @@ def load_model_and_checkpoint(args, device):
     print(f"Missing keys: {len(missing)}")
     print(f"Unexpected keys: {len(unexpected)}")
 
+    # Debug: Check if ref_encoder weights are loaded
+    if hasattr(model, 'ref_encoder'):
+        print("\n[DEBUG] Checking ref_encoder weights:")
+        ref_encoder_keys = [k for k in state_dict.keys() if 'ref_encoder' in k]
+        print(f"  Found {len(ref_encoder_keys)} ref_encoder keys in checkpoint")
+        if ref_encoder_keys:
+            print(f"  Example keys: {ref_encoder_keys[:3]}")
+        else:
+            print("  WARNING: No ref_encoder keys found in checkpoint!")
+            print("  This means ref_encoder is using random initialization!")
+
+        # Check actual parameter stats
+        total_params = sum(p.numel() for p in model.ref_encoder.parameters())
+        print(f"  ref_encoder has {total_params:,} parameters")
+
+        # Check if parameters seem initialized or random
+        first_param = next(model.ref_encoder.parameters())
+        print(f"  First param stats: mean={first_param.mean().item():.6f}, std={first_param.std().item():.6f}")
+
     return model, config
 
 
@@ -189,12 +208,33 @@ def generate_with_references(
     def ref_encoder_hook(module, input, output):
         ref_tokens_captured['output'] = output.detach()
         if debug:
-            print(f"    [DEBUG] ref_encoder output shape: {output.shape}, mean: {output.mean().item():.3f}, std: {output.std().item():.3f}")
+            # Check input
+            input_tensor = input[0]
+            print(f"    [DEBUG] ref_encoder INPUT: shape={input_tensor.shape}, mean={input_tensor.mean().item():.6f}, std={input_tensor.std().item():.6f}")
+            print(f"    [DEBUG] ref_encoder OUTPUT: shape={output.shape}, mean={output.mean().item():.6f}, std={output.std().item():.6f}")
 
-    # Register hook if model has ref_encoder
-    hook_handle = None
+    # Register hooks if model has ref_encoder
+    hook_handles = []
     if hasattr(model, 'ref_encoder'):
-        hook_handle = model.ref_encoder.register_forward_hook(ref_encoder_hook)
+        hook_handles.append(model.ref_encoder.register_forward_hook(ref_encoder_hook))
+
+        # Add hooks for intermediate layers if debug mode
+        if debug and hasattr(model.ref_encoder, 'patch_embed'):
+            def patch_embed_hook(module, input, output):
+                print(f"    [DEBUG]   patch_embed OUTPUT: shape={output.shape}, mean={output.mean().item():.6f}, std={output.std().item():.6f}")
+            hook_handles.append(model.ref_encoder.patch_embed.register_forward_hook(patch_embed_hook))
+
+        if debug and hasattr(model.ref_encoder, 'spatial_compress'):
+            def spatial_compress_hook(module, input, output):
+                print(f"    [DEBUG]   spatial_compress OUTPUT: shape={output.shape}, mean={output.mean().item():.6f}, std={output.std().item():.6f}")
+            hook_handles.append(model.ref_encoder.spatial_compress.register_forward_hook(spatial_compress_hook))
+
+        if debug and hasattr(model.ref_encoder, 'output_proj'):
+            def output_proj_hook(module, input, output):
+                in_tensor = input[0]
+                print(f"    [DEBUG]   output_proj INPUT: shape={in_tensor.shape}, mean={in_tensor.mean().item():.6f}, std={in_tensor.std().item():.6f}")
+                print(f"    [DEBUG]   output_proj OUTPUT: shape={output.shape}, mean={output.mean().item():.6f}, std={output.std().item():.6f}")
+            hook_handles.append(model.ref_encoder.output_proj.register_forward_hook(output_proj_hook))
 
     with torch.no_grad():
         # Encode text
@@ -240,8 +280,8 @@ def generate_with_references(
         z_ref_flat = z_ref.squeeze(0)  # (N, 4, h, w)
         img_refs = vae.decode(z_ref_flat / scale_factor).sample  # (N, 3, H, W)
 
-    # Remove hook
-    if hook_handle is not None:
+    # Remove all hooks
+    for hook_handle in hook_handles:
         hook_handle.remove()
 
     # Return captured ref_tokens for analysis if debug
