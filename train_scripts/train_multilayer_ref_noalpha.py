@@ -521,6 +521,7 @@ def parse_args():
     parser.add_argument('--local_rank', type=int, default=-1)
     parser.add_argument('--debug', action='store_true')
     parser.add_argument('--use_ref', default=True)
+    parser.add_argument('--model_type', default='crossattn')
 
     parser.add_argument(
         "--report_to",
@@ -657,7 +658,7 @@ if __name__ == '__main__':
     # Use 'crossattn' for better prompt alignment
     # - crossattn: Text and reference both use cross-attention (balanced, preserves text-to-image ability)
     # - adaln: Reference uses AdaLN, text uses cross-attention (reference can dominate)
-    model_type = 'crossattn'
+    model_type = args.model_type
     logger.info(f"Building MultiLayerPixArt model of type: {model_type}")
 
     if model_type == 'adaln':
