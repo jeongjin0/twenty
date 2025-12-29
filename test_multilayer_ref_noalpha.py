@@ -102,47 +102,48 @@ def load_vae_and_t5(config, device):
     return vae, text_encoder
 
 
-def load_reference_images(dataloader, image_indices, num_refs, device):
+def load_reference_images(dataloader, image_idx, layer_indices, device):
     """
-    Load reference images from dataset by image indices.
+    Load reference layers from a single image.
 
     Args:
         dataloader: MultiLayer dataloader
-        image_indices: List of dataset indices to load (e.g., [0, 1, 2])
-        num_refs: Number of reference layers to use
+        image_idx: Dataset index of the image to load
+        layer_indices: List of layer indices to use as references (e.g., [0, 1, 2, 3])
         device: torch device
 
     Returns:
-        ref_images: (num_refs, C, H, W) - reference images
-        ref_captions: List[str] - captions for each reference
+        ref_images: (num_layers, C, H, W) - reference images
+        ref_captions: List[str] - captions for each reference layer
     """
     dataset = dataloader.dataset
 
-    # Load images from the specified indices
+    if image_idx >= len(dataset):
+        raise ValueError(f"Image index {image_idx} is out of bounds (dataset size: {len(dataset)})")
+
+    # Load one image with all its layers
+    layers, captions, num_layers, image_id = dataset[image_idx]
+    # layers: (max_layers, C, H, W)
+
+    # Get specified layers as references
     all_ref_images = []
     all_ref_captions = []
 
-    for idx in image_indices:
-        if idx >= len(dataset):
-            print(f"Warning: Index {idx} is out of bounds (dataset size: {len(dataset)}). Skipping.")
+    for layer_idx in layer_indices:
+        if layer_idx >= num_layers:
+            print(f"Warning: Layer {layer_idx} exceeds available layers ({num_layers}). Skipping.")
             continue
 
-        # Get data from dataset
-        layers, captions, num_layers, image_id = dataset[idx]
-
-        # Take first layer from this image as one reference
-        # layers: (max_layers, C, H, W)
-        # We use the first actual layer (index 0)
-        ref_image = layers[0]  # (C, H, W)
-        ref_caption = captions[0]
+        ref_image = layers[layer_idx]  # (C, H, W)
+        ref_caption = captions[layer_idx]
 
         all_ref_images.append(ref_image)
         all_ref_captions.append(ref_caption)
 
-    # Stack all references: (num_refs, C, H, W)
     if len(all_ref_images) == 0:
-        raise ValueError("No valid reference images loaded!")
+        raise ValueError("No valid reference layers loaded!")
 
+    # Stack all references: (num_layers, C, H, W)
     ref_images = torch.stack(all_ref_images, dim=0).to(device)
 
     return ref_images, all_ref_captions
@@ -238,13 +239,15 @@ def main():
 
     # ============================================
     # TODO: Fill in your reference image sets!
-    # Each set should contain image IDs or indices to use as references
+    # Each set specifies:
+    #   - image_idx: which image from dataset to use
+    #   - layer_indices: which layers from that image to use as references
     # ============================================
     reference_sets = [
-        # Example sets - REPLACE WITH YOUR ACTUAL IMAGE IDs
-        {'name': 'set1_zebras', 'indices': [0, 1, 2]},
-        {'name': 'set2_horses', 'indices': [10, 11, 12]},
-        {'name': 'set3_cats', 'indices': [20, 21, 22]},
+        # Example sets - REPLACE WITH YOUR ACTUAL VALUES
+        {'name': 'set1_image0', 'image_idx': 0, 'layer_indices': [0, 1, 2, 3]},
+        {'name': 'set2_image1', 'image_idx': 1, 'layer_indices': [0, 1, 2, 3]},
+        {'name': 'set3_image2', 'image_idx': 2, 'layer_indices': [0, 1, 2, 3]},
         # Add more sets here...
     ]
 
@@ -294,23 +297,24 @@ def main():
 
     for set_idx, ref_set in enumerate(reference_sets):
         set_name = ref_set['name']
-        indices = ref_set['indices']
+        image_idx = ref_set['image_idx']
+        layer_indices = ref_set['layer_indices']
 
         print(f"\n[{set_idx+1}/{len(reference_sets)}] Generating with {set_name}...")
-        print(f"  Reference indices: {indices}")
+        print(f"  Image index: {image_idx}, Layer indices: {layer_indices}")
 
-        # Load reference images based on the indices
+        # Load reference layers from the specified image
         ref_images, ref_captions = load_reference_images(
             dataloader,
-            indices,
-            len(indices),  # Use the number of indices provided
+            image_idx,
+            layer_indices,
             device
         )
 
         print(f"  Reference shape: {ref_images.shape}")
         print(f"  Reference captions:")
         for i, cap in enumerate(ref_captions):
-            print(f"    [{i}] {cap[:80]}...")  # Print first 80 chars of each caption
+            print(f"    [Layer {layer_indices[i]}] {cap[:80]}...")  # Print first 80 chars of each caption
 
         # Generate
         img_gen, img_refs = generate_with_references(
