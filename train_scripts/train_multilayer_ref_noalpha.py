@@ -5,6 +5,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.environ['NCCL_P2P_DISABLE'] = '1'
 
+import gc
 import time
 import types
 import warnings
@@ -327,7 +328,10 @@ def train():
                     scale_factor=config.scale_factor,
                     shuffle_ref=shuffle_ref,
                     merge_augmentation_prob=merge_augmentation_prob
-                )                
+                )
+
+                # Memory optimization: clear cache after VAE encoding
+                torch.cuda.empty_cache()
 
             with torch.no_grad():
                 target_captions = [captions[b][target_indices[b]] for b in range(B)]
@@ -342,8 +346,9 @@ def train():
                     ]
 
                 caption_embs, emb_masks = text_encoder.get_text_embeddings(target_captions)
-                y = caption_embs.float()[:, None]
-                y_mask = emb_masks
+                # Move to GPU
+                y = caption_embs.float()[:, None].to(accelerator.device)
+                y_mask = emb_masks.to(accelerator.device)
 
             # 4. Sample timesteps
             timesteps = torch.randint(
@@ -405,9 +410,14 @@ def train():
 
                 optimizer.step()
                 lr_scheduler.step()
-                
+
                 if accelerator.sync_gradients:
                     ema_update(model_ema, model, config.ema_rate)
+
+            # Memory optimization: periodic cache cleanup every 10 steps
+            if (step + 1) % 10 == 0:
+                gc.collect()
+                torch.cuda.empty_cache()
 
             if global_step == 10000:
                 logger.info(f"[Step {global_step}] Unfreezing all layers")
@@ -862,7 +872,9 @@ if __name__ == '__main__':
     t5_pretrained = getattr(config, 't5_pretrained', 'google/flan-t5-xxl')
     logger.info(f"Loading T5 from: {t5_pretrained}")
 
-    text_encoder = T5Embedder(device=accelerator.device, local_cache=True, cache_dir=t5_pretrained, torch_dtype=torch.float16)
+    # Text encoder - CPU에서 실행 (메모리 절약)
+    text_encoder = T5Embedder(device='cpu', local_cache=True, cache_dir=t5_pretrained, torch_dtype=torch.float16)
+    print("[Memory Optimization] T5 text encoder on CPU")
     print_gpu_memory("After t5 load")
 
     # ============================================
