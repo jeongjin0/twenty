@@ -328,8 +328,9 @@ def main():
         for sample_idx in range(args.num_samples):
             print(f"  Generating sample {sample_idx + 1}/{args.num_samples}...")
 
-            # Set different seed for each sample
-            torch.manual_seed(42 + sample_idx)
+            # Set different seed for each sample and each reference set
+            seed = 42 + set_idx * 1000 + sample_idx
+            torch.manual_seed(seed)
 
             img_gen, img_refs_tmp = generate_with_references(
                 model=model,
