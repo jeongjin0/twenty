@@ -331,6 +331,16 @@ def train():
 
             with torch.no_grad():
                 target_captions = [captions[b][target_indices[b]] for b in range(B)]
+
+                # Text dropout: 일정 확률로 caption을 빈 문자열로 대체
+                text_dropout_prob = getattr(config, 'text_dropout_prob', 0.0)
+                if text_dropout_prob > 0:
+                    import random
+                    target_captions = [
+                        "" if random.random() < text_dropout_prob else cap
+                        for cap in target_captions
+                    ]
+
                 caption_embs, emb_masks = text_encoder.get_text_embeddings(target_captions)
                 y = caption_embs.float()[:, None]
                 y_mask = emb_masks
@@ -664,15 +674,23 @@ if __name__ == '__main__':
         ).train()
     elif model_type == 'crossattn':
         from diffusion.model.nets.PixArt_reference_crossattn import ReferencePixArtCrossAttn_XL_2
+
+        use_clip_ref_encoder = getattr(config, 'use_clip_ref_encoder', False)
+        clip_model_name = getattr(config, 'clip_model_name', "openai/clip-vit-large-patch14")
+        freeze_clip = getattr(config, 'freeze_clip', True)
+
         model = ReferencePixArtCrossAttn_XL_2(
-            input_size=latent_size,\
+            input_size=latent_size,
             in_channels=4,
             max_ref_layers=max_layers - 1,
             ref_encoder_depth=4,
-            ref_compression_ratio=4, 
+            ref_compression_ratio=4,
             caption_channels=4096,
             model_max_length=config.model_max_length,
             pred_sigma=pred_sigma,
+            use_clip_ref_encoder=use_clip_ref_encoder,
+            clip_model_name=clip_model_name,
+            freeze_clip=freeze_clip,
         ).train()
 
 
