@@ -36,10 +36,16 @@ clip_model_name = "openai/clip-vit-large-patch14"  # CLIP model name
 freeze_clip = True  # Freeze CLIP weights (only train projection layer)
 
 # ============================================
-# 🔥 NEW: Text Dropout Settings
+# 🔥 NEW: Text Dropout Settings (Dynamic)
 # ============================================
-text_dropout_prob = 0.0  # 50% 확률로 text를 빈 문자열로 대체
-                         # Reference를 필수로 만들어서 학습 강제
+# Stage 1 (0~10000 steps): High dropout to force reference usage
+text_dropout_prob_initial = 0.9  # 90% text dropout - ref encoder must be used
+
+# Stage 2 (10000+ steps): Lower dropout for balanced learning
+text_dropout_prob_final = 0.1    # 10% text dropout - ref as optional guidance
+
+# Transition point
+text_dropout_transition_step = 10000
 
 # ============================================
 # Training Settings

@@ -336,8 +336,17 @@ def train():
             with torch.no_grad():
                 target_captions = [captions[b][target_indices[b]] for b in range(B)]
 
-                # Text dropout: 일정 확률로 caption을 빈 문자열로 대체
-                text_dropout_prob = getattr(config, 'text_dropout_prob', 0.0)
+                # Dynamic text dropout: High dropout initially to force reference usage
+                dropout_initial = getattr(config, 'text_dropout_prob_initial', 0.9)
+                dropout_final = getattr(config, 'text_dropout_prob_final', 0.1)
+                transition_step = getattr(config, 'text_dropout_transition_step', 10000)
+
+                # Calculate current dropout probability
+                if global_step < transition_step:
+                    text_dropout_prob = dropout_initial
+                else:
+                    text_dropout_prob = dropout_final
+
                 if text_dropout_prob > 0:
                     import random
                     target_captions = [
@@ -419,13 +428,9 @@ def train():
                 gc.collect()
                 torch.cuda.empty_cache()
 
-            if global_step == 10000:
-                logger.info(f"[Step {global_step}] Unfreezing all layers")
-                for param in model.parameters():
-                    param.requires_grad = True
-                
-                # optimizer = build_optimizer(accelerator.unwrap_model(model), config.optimizer)
-                # optimizer = accelerator.prepare(optimizer)
+            # Log dropout transition
+            if global_step == transition_step:
+                logger.info(f"[Step {global_step}] Transitioning text dropout: {dropout_initial} -> {dropout_final}")
 
             # ============================================
             # 6. Logging
@@ -451,7 +456,7 @@ def train():
 
                 info = f"Step/Epoch [{(epoch-1)*len(train_dataloader)+step+1}/{epoch}][{step + 1}/{len(train_dataloader)}]: " \
                        f"total_eta: {eta}, epoch_eta: {eta_epoch}, time_all: {t:.3f}, time_data: {t_d:.3f}, " \
-                       f"lr: {lr:.3e}, latent: ({h}, {w}), layers: {N} (avg: {avg_layers:.1f}), "
+                       f"lr: {lr:.3e}, text_drop: {text_dropout_prob:.2f}, latent: ({h}, {w}), layers: {N} (avg: {avg_layers:.1f}), "
                 info += ', '.join([f"{k}: {v:.4f}" for k, v in log_buffer.output.items()])
                 logger.info(info)
                 
