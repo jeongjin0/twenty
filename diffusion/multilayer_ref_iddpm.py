@@ -137,24 +137,21 @@ class ReferenceIDDPM:
             cfg_scale=cfg_scale,
             device=device,
         )
-        
+
         # Decode both (RGB only, channels 0-3)
         z_gen_rgb = z_gen[:, :4] / scale_factor
         z_target_rgb = z_target[:, :4] / scale_factor
-        z_ref_rgb = z_ref[:, :, :4] / scale_factor  # (B, N_ref, 4, h, w)
-        
+
         img_gen = vae.decode(z_gen_rgb).sample  # (B, 3, H, W)
         img_target = vae.decode(z_target_rgb).sample
-        
-        # Decode refs
-        B, N_ref, _, h, w = z_ref_rgb.shape
-        z_ref_flat = z_ref_rgb.reshape(B * N_ref, 4, h, w)
-        img_ref_flat = vae.decode(z_ref_flat).sample
-        img_ref = img_ref_flat.reshape(B, N_ref, 3, img_ref_flat.shape[-2], img_ref_flat.shape[-1])
-        
+
+        # z_ref is now pixel RGB, not VAE latent - no decoding needed
+        # z_ref shape: (B, N_ref, 3, H, W)
+        img_ref = z_ref  # Already in pixel space
+
         # Compute metrics
         mse = F.mse_loss(img_gen, img_target).item()
-        
+
         return {
             'img_gen': img_gen,      # (B, 3, H, W)
             'img_target': img_target,  # (B, 3, H, W)
