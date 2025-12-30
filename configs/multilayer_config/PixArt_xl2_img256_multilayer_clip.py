@@ -38,10 +38,10 @@ freeze_clip = True  # Freeze CLIP weights (only train projection layer)
 # ============================================
 # 🔥 NEW: Text Dropout Settings (Dynamic)
 # ============================================
-# Stage 1 (0~10000 steps): High dropout to force reference usage
-text_dropout_prob_initial = 0.9  # 90% text dropout - ref encoder must be used
+# Stage 1 (0~10000 steps): Moderate dropout to encourage reference usage
+text_dropout_prob_initial = 0.3  # 30% text dropout - balanced learning with ref
 
-# Stage 2 (10000+ steps): Lower dropout for balanced learning
+# Stage 2 (10000+ steps): Lower dropout for optional guidance
 text_dropout_prob_final = 0.1    # 10% text dropout - ref as optional guidance
 
 # Transition point

@@ -107,7 +107,9 @@ def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
 class CLIPReferenceEncoder(nn.Module):
     """
     CLIP Vision Encoder를 사용한 Reference Encoder.
-    Pretrained CLIP으로 시작해서 의미 있는 visual features 추출.
+    Pixel space RGB 이미지에서 semantic features 추출.
+
+    IMPORTANT: 이 encoder는 pixel space RGB 이미지를 입력으로 받음 (VAE latent 아님)
     """
     def __init__(
         self,
@@ -117,7 +119,7 @@ class CLIPReferenceEncoder(nn.Module):
         freeze_clip=True,
     ):
         super().__init__()
-        from transformers import CLIPVisionModel
+        from transformers import CLIPVisionModel, CLIPImageProcessor
 
         self.hidden_size = hidden_size
         self.max_layers = max_layers
@@ -125,6 +127,9 @@ class CLIPReferenceEncoder(nn.Module):
         # Load pretrained CLIP vision encoder
         self.clip_encoder = CLIPVisionModel.from_pretrained(clip_model_name)
         clip_hidden_size = self.clip_encoder.config.hidden_size  # 1024 for large
+
+        # CLIP image processor for normalization
+        self.clip_processor = CLIPImageProcessor.from_pretrained(clip_model_name)
 
         if freeze_clip:
             for param in self.clip_encoder.parameters():
@@ -145,24 +150,20 @@ class CLIPReferenceEncoder(nn.Module):
         nn.init.normal_(self.layer_embed, std=0.02)
         nn.init.normal_(self.ref_type_embed, std=0.02)
 
-    def forward(self, ref_layers):
+    def forward(self, ref_images_rgb):
         """
-        ref_layers: (B, N_ref, C, H, W) - reference images in latent space
+        ref_images_rgb: (B, N_ref, 3, H, W) - reference RGB images in PIXEL SPACE [0, 1]
         Returns: (B, N_ref * num_patches, D) - token sequence for cross-attention
         """
-        B, N_ref, C, H, W = ref_layers.shape
-        device = ref_layers.device
+        B, N_ref, C, H, W = ref_images_rgb.shape
+        device = ref_images_rgb.device
 
-        # CLIP expects 3-channel RGB images in [-1, 1]
-        # ref_layers is latent (4 channels), so we need to decode first
-        # For now, we'll just take first 3 channels and normalize
-        # TODO: Better handling - maybe decode to pixel space first
-        ref_rgb = ref_layers[:, :, :3, :, :]  # (B, N_ref, 3, H, W)
+        assert C == 3, f"Expected 3-channel RGB, got {C} channels"
 
         # Reshape for CLIP: (B*N_ref, 3, H, W)
-        ref_rgb_flat = ref_rgb.reshape(B * N_ref, 3, H, W)
+        ref_rgb_flat = ref_images_rgb.reshape(B * N_ref, 3, H, W)
 
-        # Interpolate to CLIP expected size (224x224)
+        # Resize to CLIP expected size (224x224)
         ref_rgb_resized = F.interpolate(
             ref_rgb_flat,
             size=(224, 224),
@@ -170,8 +171,14 @@ class CLIPReferenceEncoder(nn.Module):
             align_corners=False
         )
 
+        # CLIP normalization: [0, 1] -> CLIP normalized
+        # CLIP expects mean=[0.48145466, 0.4578275, 0.40821073], std=[0.26862954, 0.26130258, 0.27577711]
+        mean = torch.tensor([0.48145466, 0.4578275, 0.40821073], device=device).view(1, 3, 1, 1)
+        std = torch.tensor([0.26862954, 0.26130258, 0.27577711], device=device).view(1, 3, 1, 1)
+        ref_rgb_normalized = (ref_rgb_resized - mean) / std
+
         # Get CLIP features
-        clip_outputs = self.clip_encoder(pixel_values=ref_rgb_resized)
+        clip_outputs = self.clip_encoder(pixel_values=ref_rgb_normalized)
         clip_features = clip_outputs.last_hidden_state  # (B*N_ref, num_patches, clip_hidden_size)
 
         # Project to model hidden size
