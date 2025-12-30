@@ -31,7 +31,7 @@ learn_sigma = True
 # ============================================
 # 🔥 NEW: CLIP Reference Encoder Settings
 # ============================================
-use_clip_ref_encoder = True  # Use pretrained CLIP vision encoder
+use_clip_ref_encoder = False  # Use custom reference encoder (train from scratch)
 clip_model_name = "openai/clip-vit-large-patch14"  # CLIP model name
 freeze_clip = True  # Freeze CLIP weights (only train projection layer)
 

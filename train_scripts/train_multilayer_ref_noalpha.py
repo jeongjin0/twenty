@@ -132,7 +132,7 @@ def extract_reference_rgb_pixel(layers, num_layers, target_indices, shuffle_ref=
 def encode_reference_vae_rgb_batch(vae, layers, num_layers, target_indices, scale_factor=0.18215,
                                    shuffle_ref=True, merge_augmentation_prob=0.0):
     """
-    Alpha 없이 RGB만 처리하는 VAE 인코딩 (Target 이미지용)
+    Alpha 없이 RGB만 처리하는 VAE 인코딩
 
     Args:
         vae: VAE model
@@ -145,6 +145,7 @@ def encode_reference_vae_rgb_batch(vae, layers, num_layers, target_indices, scal
 
     Returns:
         z_target: (B, 4, h, w)
+        z_ref: (B, max_ref, 4, h, w)
     """
     B, N, C, H, W = layers.shape
     device = layers.device
@@ -152,17 +153,35 @@ def encode_reference_vae_rgb_batch(vae, layers, num_layers, target_indices, scal
     # RGB만 VAE encoding
     rgb = layers[:, :, :3, :, :]  # (B, N, 3, H, W)
 
-    # Target 이미지만 추출
+    rgb_flat = rgb.reshape(B * N, 3, H, W)
+    z_rgb_flat = vae.encode(rgb_flat).latent_dist.mode() * scale_factor
+
+    _, C_latent, h, w = z_rgb_flat.shape  # C_latent = 4
+    z_all = z_rgb_flat.reshape(B, N, C_latent, h, w)  # (B, N, 4, h, w)
+
+    # Batch별로 target/reference 분리
     z_target_list = []
+    z_ref_list = []
+
     for b in range(B):
         t_idx = target_indices[b]
-        target_rgb = rgb[b, t_idx]  # (3, H, W)
-        z_target = vae.encode(target_rgb.unsqueeze(0)).latent_dist.mode() * scale_factor  # (1, 4, h, w)
-        z_target_list.append(z_target.squeeze(0))  # (4, h, w)
+        z_target_list.append(z_all[b, t_idx])  # (4, h, w)
+
+        # Reference indices (exclude target)
+        ref_indices = [i for i in range(N) if i != t_idx]
+
+        # Shuffle reference order
+        if shuffle_ref:
+            import random
+            random.shuffle(ref_indices)
+
+        z_ref_b = z_all[b, ref_indices]  # (N-1, 4, h, w)
+        z_ref_list.append(z_ref_b)
 
     z_target = torch.stack(z_target_list, dim=0)  # (B, 4, h, w)
+    z_ref = torch.stack(z_ref_list, dim=0)  # (B, N-1, 4, h, w)
 
-    return z_target
+    return z_target, z_ref
 
 
 def set_fsdp_env():
@@ -198,15 +217,8 @@ def run_evaluation(model, vae, multilayer_diffusion, dataloader, text_encoder,
         target_idx = torch.randint(0, actual_layers, (1,)).item() #target layer is 0 or 1
         target_indices = [min(target_idx, num_layers[b].item() - 1) for b in range(B)]
 
-        # Extract reference RGB in pixel space for CLIP
-        ref_rgb_pixel = extract_reference_rgb_pixel(
-            layers, num_layers,
-            target_indices=target_indices,
-            shuffle_ref=False
-        )
-
-        # Encode target with VAE
-        z_target = encode_reference_vae_rgb_batch(
+        # VAE encoding for both target and references
+        z_target, z_ref = encode_reference_vae_rgb_batch(
             vae, layers, num_layers,
             target_indices=target_indices,
             scale_factor=config.scale_factor
@@ -225,18 +237,18 @@ def run_evaluation(model, vae, multilayer_diffusion, dataloader, text_encoder,
             model=accelerator.unwrap_model(model),
             vae=vae,
             z_target=z_target,
-            z_ref=ref_rgb_pixel,  # Now pixel RGB for CLIP
+            z_ref=z_ref,  # VAE latent
             y=y,
             steps=20,
             cfg_scale=4.5,
             scale_factor=config.scale_factor,
         )
-    
+
     # Plot and save
     os.makedirs(save_dir, exist_ok=True)
-    
+
     for b in range(min(B, 4)):  # 최대 4개 샘플
-        n_ref = ref_rgb_pixel.shape[1]
+        n_ref = z_ref.shape[1]
 
         # Collect images: refs + target(GT) + generated
         images = []
@@ -319,22 +331,16 @@ def train():
 
                 # Augmentation settings
                 shuffle_ref = getattr(config, 'shuffle_ref', True)
+                merge_augmentation_prob = getattr(config, 'merge_augmentation_prob', 0.0)
 
-                # 1. Extract reference RGB images in PIXEL SPACE (for CLIP)
-                ref_rgb_pixel = extract_reference_rgb_pixel(
-                    layers, num_layers,
-                    target_indices=target_indices,
-                    shuffle_ref=shuffle_ref
-                )  # (B, N_ref, 3, H, W) in [0, 1]
-
-                # 2. Encode target image with VAE
-                z_target = encode_reference_vae_rgb_batch(
+                # VAE encoding for both target and references
+                z_target, z_ref = encode_reference_vae_rgb_batch(
                     vae, layers, num_layers,
                     target_indices=target_indices,
                     scale_factor=config.scale_factor,
                     shuffle_ref=shuffle_ref,
-                    merge_augmentation_prob=0.0
-                )  # (B, 4, h, w)
+                    merge_augmentation_prob=merge_augmentation_prob
+                )
 
                 # Memory optimization: clear cache after VAE encoding
                 torch.cuda.empty_cache()
@@ -382,7 +388,7 @@ def train():
                     model_kwargs=dict(
                         y=y,
                         mask=y_mask,
-                        x_ref=ref_rgb_pixel,  # (B, N_ref, 3, H, W) - pixel space RGB for CLIP
+                        x_ref=z_ref,  # (B, N-1, 4, h, w) - VAE latent
                     ),
                 )
                 
