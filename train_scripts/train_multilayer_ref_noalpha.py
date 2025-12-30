@@ -198,7 +198,15 @@ def run_evaluation(model, vae, multilayer_diffusion, dataloader, text_encoder,
         target_idx = torch.randint(0, actual_layers, (1,)).item() #target layer is 0 or 1
         target_indices = [min(target_idx, num_layers[b].item() - 1) for b in range(B)]
 
-        z_target, z_ref = encode_reference_vae_rgb_batch(
+        # Extract reference RGB in pixel space for CLIP
+        ref_rgb_pixel = extract_reference_rgb_pixel(
+            layers, num_layers,
+            target_indices=target_indices,
+            shuffle_ref=False
+        )
+
+        # Encode target with VAE
+        z_target = encode_reference_vae_rgb_batch(
             vae, layers, num_layers,
             target_indices=target_indices,
             scale_factor=config.scale_factor
@@ -208,16 +216,16 @@ def run_evaluation(model, vae, multilayer_diffusion, dataloader, text_encoder,
         # T5 encoding
         caption_embs, emb_masks = text_encoder.get_text_embeddings(target_captions)
         y = caption_embs.float()[:, None]
-    
+
 
     with torch.no_grad():
-          
+
         # Evaluate
         results = multilayer_diffusion.evaluate(
             model=accelerator.unwrap_model(model),
             vae=vae,
             z_target=z_target,
-            z_ref=z_ref,
+            z_ref=ref_rgb_pixel,  # Now pixel RGB for CLIP
             y=y,
             steps=20,
             cfg_scale=4.5,
@@ -228,8 +236,8 @@ def run_evaluation(model, vae, multilayer_diffusion, dataloader, text_encoder,
     os.makedirs(save_dir, exist_ok=True)
     
     for b in range(min(B, 4)):  # 최대 4개 샘플
-        n_ref = z_ref.shape[1]
-        
+        n_ref = ref_rgb_pixel.shape[1]
+
         # Collect images: refs + target(GT) + generated
         images = []
         for r in range(n_ref):
