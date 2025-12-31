@@ -53,62 +53,62 @@ class ReferenceIDDPM:
 
     @torch.no_grad()
     def ddim_sample(self, model, shape, y, x_ref, mask=None, steps=20, cfg_scale=4.5, device='cuda'):
-        """DDIM Sampling"""
+        """DDIM Sampling - Identical to inference SimpleDDIMSampler"""
         # Build alpha schedule
         alphas_cumprod = self.iddpm.alphas_cumprod
         if isinstance(alphas_cumprod, np.ndarray):
             alphas_cumprod = torch.from_numpy(alphas_cumprod)
         alphas_cumprod = alphas_cumprod.to(device)
+
         # Start from noise
         x = torch.randn(shape, device=device)
-        
+
         # Timestep sequence
         timesteps = torch.linspace(self.num_timesteps - 1, 0, steps + 1, dtype=torch.long, device=device)
-        
-        # Get null_y for CFG
-        null_y = model.y_embedder.y_embedding.unsqueeze(0).unsqueeze(0).to(device).to(y.dtype)
-        
+
         for i in tqdm(range(steps), desc="DDIM Sampling", leave=False):
             t = timesteps[i]
             t_next = timesteps[i + 1]
             t_batch = t.expand(shape[0])
 
-            # CFG: Batched version like inference
-            # Both conditional and unconditional use reference (model expects it)
+            # CFG - exactly like SimpleDDIMSampler
             x_in = torch.cat([x, x], dim=0)
             t_in = torch.cat([t_batch, t_batch], dim=0)
-            y_in = torch.cat([y, null_y.expand(y.shape[0], -1, -1, -1)], dim=0)
+
+            null_y = model.y_embedder.y_embedding.unsqueeze(0).unsqueeze(0)  # (1, 1, L, D)
+            null_y = null_y.to(y.device).to(y.dtype)
+            y_in = torch.cat([y, null_y], dim=0)
+
             x_ref_in = torch.cat([x_ref, x_ref], dim=0)
 
-            # Batched forward
-            out = model(
-                x_target=x_in,
-                timestep=t_in,
-                y=y_in,
-                x_ref=x_ref_in,
-                mask=mask,
-            )
-
-            # Split conditional and unconditional
-            out_cond, out_uncond = out.chunk(2, dim=0)
-            
-            in_channels = shape[1]
-            if out_cond.shape[1] == 2 * in_channels:
-                eps_cond = out_cond[:, :in_channels]
-                eps_uncond = out_uncond[:, :in_channels]
+            if mask is not None:
+                null_mask = torch.ones(1, mask.shape[1], device=mask.device, dtype=mask.dtype)
+                mask_in = torch.cat([mask, null_mask], dim=0)
             else:
-                eps_cond = out_cond
-                eps_uncond = out_uncond
-            
-            noise_pred = eps_uncond + cfg_scale * (eps_cond - eps_uncond)
-            
+                mask_in = None
+
+            try:
+                noise_pred = model(x_in, t_in, y_in, x_ref_in, mask=mask_in)
+            except:
+                noise_pred = model(x_in, t_in, y_in, mask=mask_in)
+
+
+            noise_pred_cond, noise_pred_uncond = noise_pred.chunk(2, dim=0)
+            # pred_sigma=True면 출력이 2*in_channels (noise + sigma)
+            in_channels = shape[1]
+            if noise_pred_cond.shape[1] == in_channels * 2:
+                noise_pred_cond = noise_pred_cond[:, :in_channels]
+                noise_pred_uncond = noise_pred_uncond[:, :in_channels]
+
+            noise_pred = noise_pred_uncond + cfg_scale * (noise_pred_cond - noise_pred_uncond)
+
             # DDIM update
             alpha_t = alphas_cumprod[t]
             alpha_t_next = alphas_cumprod[t_next] if t_next >= 0 else torch.tensor(1.0, device=device)
-            
+
             x0_pred = (x - torch.sqrt(1 - alpha_t) * noise_pred) / torch.sqrt(alpha_t)
             x = torch.sqrt(alpha_t_next) * x0_pred + torch.sqrt(1 - alpha_t_next) * noise_pred
-        
+
         return x
     
     @torch.no_grad()
