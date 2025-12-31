@@ -277,6 +277,7 @@ def generate_with_references(
             shape=(1, 4, h, w),
             y=y,
             x_ref=z_ref,
+            mask=emb_masks,
             steps=steps,
             cfg_scale=cfg_scale,
             device=device,
