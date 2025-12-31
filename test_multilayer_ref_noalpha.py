@@ -253,6 +253,7 @@ def generate_with_references(
         # Encode text
         caption_embs, emb_masks = text_encoder.get_text_embeddings([prompt])
         y = caption_embs.float()[:, None].to(device)
+        emb_masks = emb_masks.to(device)
 
         # Encode references to latent space
         # ref_images: (N, 3, H, W)

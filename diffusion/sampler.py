@@ -42,10 +42,8 @@ class SimpleDDIMSampler:
             else:
                 mask_in = None
 
-            try:
-                noise_pred = model(x_in, t_in, y_in, x_ref_in, mask=mask_in)
-            except:
-                noise_pred = model(x_in, t_in, y_in, mask=mask_in)
+            # Call model with references
+            noise_pred = model(x_in, t_in, y_in, x_ref_in, mask=mask_in)
 
 
             noise_pred_cond, noise_pred_uncond = noise_pred.chunk(2, dim=0)
