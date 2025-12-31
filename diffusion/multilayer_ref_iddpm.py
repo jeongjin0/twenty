@@ -73,23 +73,24 @@ class ReferenceIDDPM:
             t_next = timesteps[i + 1]
             t_batch = t.expand(shape[0])
 
-            # CFG: conditional (text + ref) vs unconditional (no text, no ref)
-            # Conditional: text + reference
-            out_cond = model(
-                x_target=x,
-                timestep=t_batch,
-                y=y,
-                x_ref=x_ref,
-                mask=None,
+            # CFG: Batched version like inference
+            # Both conditional and unconditional use reference (model expects it)
+            x_in = torch.cat([x, x], dim=0)
+            t_in = torch.cat([t_batch, t_batch], dim=0)
+            y_in = torch.cat([y, null_y.expand(y.shape[0], -1, -1, -1)], dim=0)
+            x_ref_in = torch.cat([x_ref, x_ref], dim=0)
+
+            # Batched forward
+            out = model(
+                x_target=x_in,
+                timestep=t_in,
+                y=y_in,
+                x_ref=x_ref_in,
+                mask=mask,
             )
 
-            # Unconditional: no text, no reference
-            out_uncond = model.forward_without_ref(
-                x_target=x,
-                timestep=t_batch,
-                y=null_y.expand(y.shape[0], -1, -1, -1),
-                mask=None,
-            )
+            # Split conditional and unconditional
+            out_cond, out_uncond = out.chunk(2, dim=0)
             
             in_channels = shape[1]
             if out_cond.shape[1] == 2 * in_channels:
