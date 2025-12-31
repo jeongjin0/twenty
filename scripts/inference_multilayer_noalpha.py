@@ -25,72 +25,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from diffusion.model.t5 import T5Embedder
 from diffusion.model.nets.PixArt_multilayer import ReferencePixArt_XL_2
-
-
-class SimpleDDIMSampler:
-    """간단한 DDIM Sampler"""
-    def __init__(self, num_timesteps=1000):
-        self.num_timesteps = num_timesteps
-        betas = torch.linspace(0.0001, 0.02, num_timesteps)
-        alphas = 1.0 - betas
-        self.alphas_cumprod = torch.cumprod(alphas, dim=0)
-    
-    @torch.no_grad()
-    def sample(self, model, shape, y, y_mask, x_ref, cfg_scale=4.5, steps=20, device='cuda'):
-        """DDIM Sampling with reference"""
-        self.alphas_cumprod = self.alphas_cumprod.to(device)
-
-        
-        x = torch.randn(shape, device=device)
-        timesteps = torch.linspace(self.num_timesteps - 1, 0, steps + 1, dtype=torch.long, device=device)
-        
-        for i in tqdm(range(steps), desc="Sampling"):
-            t = timesteps[i]
-            t_next = timesteps[i + 1]
-            t_batch = t.expand(shape[0])
-            
-            # CFG
-            x_in = torch.cat([x, x], dim=0)
-            t_in = torch.cat([t_batch, t_batch], dim=0)
-
-            null_y = model.y_embedder.y_embedding.unsqueeze(0).unsqueeze(0)  # (1, 1, L, 4096)
-            null_y = null_y.to(y.device).to(y.dtype)
-            y_in = torch.cat([y, null_y], dim=0)
-
-            x_ref_in = torch.cat([x_ref, x_ref], dim=0)
-            
-            null_mask = torch.ones(1, y_mask.shape[1], device=y_mask.device, dtype=y_mask.dtype)
-            mask_in = torch.cat([y_mask, null_mask], dim=0)
-
-            try:
-                noise_pred = model(x_in, t_in, y_in, x_ref_in, mask=mask_in)
-            except:
-                noise_pred = model(x_in, t_in, y_in, mask=mask_in)
-
-            
-            noise_pred_cond, noise_pred_uncond = noise_pred.chunk(2, dim=0)
-            # pred_sigma=True면 출력이 2*in_channels (noise + sigma)
-            in_channels = shape[1]
-            if noise_pred_cond.shape[1] == in_channels * 2:
-                noise_pred_cond = noise_pred_cond[:, :in_channels]
-                noise_pred_uncond = noise_pred_uncond[:, :in_channels]
-
-            noise_pred = noise_pred_uncond + cfg_scale * (noise_pred_cond - noise_pred_uncond)
-            
-            alpha_t = self.alphas_cumprod[t]
-            alpha_t_next = self.alphas_cumprod[t_next] if t_next >= 0 else torch.tensor(1.0, device=device)
-            
-            x0_pred = (x - torch.sqrt(1 - alpha_t) * noise_pred) / torch.sqrt(alpha_t)
-            x = torch.sqrt(alpha_t_next) * x0_pred + torch.sqrt(1 - alpha_t_next) * noise_pred
-        
-
-            if i == 0 or i == steps - 1:
-                print(f"Step {i}:")
-                print(f"  x mean: {x.mean():.4f}, std: {x.std():.4f}")
-                print(f"  noise_pred mean: {noise_pred.mean():.4f}, std: {noise_pred.std():.4f}")
-                print(f"  x0_pred mean: {x0_pred.mean():.4f}, std: {x0_pred.std():.4f}")
-
-        return x
+from diffusion.sampler import SimpleDDIMSampler
 
 
 def load_image(path, size=256):
