@@ -36,8 +36,11 @@ class SimpleDDIMSampler:
 
             x_ref_in = torch.cat([x_ref, x_ref], dim=0)
 
-            null_mask = torch.ones(1, y_mask.shape[1], device=y_mask.device, dtype=y_mask.dtype)
-            mask_in = torch.cat([y_mask, null_mask], dim=0)
+            if y_mask is not None:
+                null_mask = torch.ones(1, y_mask.shape[1], device=y_mask.device, dtype=y_mask.dtype)
+                mask_in = torch.cat([y_mask, null_mask], dim=0)
+            else:
+                mask_in = None
 
             try:
                 noise_pred = model(x_in, t_in, y_in, x_ref_in, mask=mask_in)
