@@ -39,7 +39,6 @@ class SimpleDDIMSampler:
     def sample(self, model, shape, y, y_mask, x_ref, cfg_scale=4.5, steps=20, device='cuda'):
         """DDIM Sampling with reference"""
         self.alphas_cumprod = self.alphas_cumprod.to(device)
-        print("model use_ref:", model.use_ref)
 
         
         x = torch.randn(shape, device=device)
@@ -141,17 +140,31 @@ def main():
     
     latent_size = args.image_size // 8
 
-    model = ReferencePixArt_XL_2(
+    # model = ReferencePixArt_XL_2(
+    #     input_size=latent_size,
+    #     in_channels=4,
+    #     max_ref_layers=7,
+    #     ref_encoder_depth=4,
+    #     caption_channels=4096,
+    #     model_max_length=120,
+    #     pred_sigma=True,
+    #     use_ref=args.use_ref,
+    # ).to(device).eval()
+
+    from diffusion.model.nets.PixArt_reference_crossattn import ReferencePixArtCrossAttn_XL_2
+
+
+    model = ReferencePixArtCrossAttn_XL_2(
         input_size=latent_size,
         in_channels=4,
         max_ref_layers=7,
         ref_encoder_depth=4,
+        ref_compression_ratio=4,
         caption_channels=4096,
         model_max_length=120,
         pred_sigma=True,
-        use_ref=args.use_ref,
     ).to(device).eval()
-    print("model use_ref:", model.use_ref)
+
     print("args use ref:", args.use_ref)
 
 

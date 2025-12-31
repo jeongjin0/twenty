@@ -57,7 +57,6 @@ def load_model_and_checkpoint(args, device):
             caption_channels=4096,
             model_max_length=config.model_max_length,
             pred_sigma=pred_sigma,
-            use_ref=True,
         ).to(device).eval()
     else:
         raise ValueError(f"Unknown model type: {args.model_type}")
