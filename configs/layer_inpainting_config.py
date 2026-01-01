@@ -19,14 +19,28 @@ caption_type = 'blip2'  # or 't5', 'blip2'
 batch_size = 16
 num_workers = 4
 num_epochs = 60
-lr = 5e-5
-weight_decay = 0.0
 gradient_clip = 1.0
 gradient_accumulation_steps = 1
 gradient_checkpointing = True
 
+# Optimizer
+optimizer = dict(
+    type='AdamW',
+    lr=5e-5,
+    weight_decay=0.0,
+    betas=(0.9, 0.999),
+)
+
+# LR Scheduler
+lr_scheduler = 'constant'
+
+# EMA
+ema_rate = 0.9999
+
 # Diffusion
 train_sampling_steps = 1000
+scale_factor = 0.18215
+snr_loss = False
 
 # Pretrained models
 pretrained_pixart_path = '/workspace/twenty/PixArt-alpha/PixArt-XL-2-256x256.pth'
@@ -36,6 +50,7 @@ text_encoder_name = '/workspace/twenty/PixArt-alpha'
 # Logging & Saving
 log_interval = 50
 save_model_epochs = 5  # Save every 5 epochs
+save_model_steps = 5000  # Save every 5000 steps
 
 # Output
 work_dir = 'output/layer_inpainting_v1'

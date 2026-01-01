@@ -4,6 +4,7 @@ Training script for Layer-wise Inpainting
 
 import argparse
 import datetime
+import gc
 import os
 import sys
 import time
@@ -27,9 +28,23 @@ from diffusion import IDDPM
 from diffusion.data.multilayer_builder import build_mulan_dataloader
 from diffusion.utils.logger import get_root_logger
 from diffusion.utils.misc import set_random_seed, read_config, DebugUnderflowOverflow
+from diffusion.utils.checkpoint import save_checkpoint, load_checkpoint
+from diffusion.utils.lr_scheduler import build_lr_scheduler
+from diffusion.utils.optimizer import build_optimizer, auto_scale_lr
+from diffusion.utils.dist_utils import get_world_size
 from accelerate import Accelerator, InitProcessGroupKwargs
+from copy import deepcopy
 
 warnings.filterwarnings("ignore")
+
+
+def ema_update(model_dest, model_src, rate):
+    """Update EMA model parameters"""
+    param_dict_src = dict(model_src.named_parameters())
+    for p_name, p_dest in model_dest.named_parameters():
+        p_src = param_dict_src[p_name]
+        assert p_src is not p_dest
+        p_dest.data.mul_(rate).add_((1 - rate) * p_src.data)
 
 
 def train():
@@ -139,37 +154,62 @@ def train():
     # ============================================
     # Diffusion
     # ============================================
-    diffusion = IDDPM(str(config.train_sampling_steps))
+    pred_sigma = getattr(config, 'pred_sigma', True)
+    learn_sigma = pred_sigma and getattr(config, 'learn_sigma', True)
+    diffusion = IDDPM(
+        str(config.train_sampling_steps),
+        learn_sigma=learn_sigma,
+        pred_sigma=pred_sigma,
+        snr=getattr(config, 'snr_loss', False)
+    )
 
     # ============================================
-    # Optimizer
+    # Optimizer & LR Scheduler
     # ============================================
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=config.lr,
-        weight_decay=config.weight_decay,
-        betas=(0.9, 0.999),
-    )
+    # Auto-scale learning rate for distributed training
+    lr_scale_ratio = 1
+    if config.get('auto_lr', None):
+        lr_scale_ratio = auto_scale_lr(
+            config.batch_size * get_world_size() * config.gradient_accumulation_steps,
+            config.optimizer,
+            **config.auto_lr
+        )
+        logger.info(f"Auto scaling lr by ratio: {lr_scale_ratio:.2f}")
+
+    optimizer = build_optimizer(model, config.optimizer)
+    lr_scheduler = build_lr_scheduler(config, optimizer, train_dataloader, lr_scale_ratio)
+
+    # Create EMA model
+    model_ema = deepcopy(model).eval()
+    ema_update(model_ema, model, 0.)
+    logger.info("EMA model created")
 
     # ============================================
     # Prepare with Accelerator
     # ============================================
-    model, optimizer, train_dataloader = accelerator.prepare(model, optimizer, train_dataloader)
+    model, model_ema = accelerator.prepare(model, model_ema)
+    optimizer, train_dataloader, lr_scheduler = accelerator.prepare(optimizer, train_dataloader, lr_scheduler)
 
     # ============================================
     # Resume from checkpoint
     # ============================================
     start_epoch = 0
-    global_step = 0
 
     if args.resume:
         logger.info(f"Resuming from checkpoint: {args.resume}")
-        ckpt = torch.load(args.resume, map_location='cpu')
-        model.load_state_dict(ckpt['model'])
-        optimizer.load_state_dict(ckpt['optimizer'])
-        start_epoch = ckpt.get('epoch', 0)
-        global_step = ckpt.get('global_step', 0)
-        logger.info(f"Resumed from epoch {start_epoch}, step {global_step}")
+        start_epoch, missing, unexpected = load_checkpoint(
+            checkpoint=args.resume,
+            model=model,
+            model_ema=model_ema,
+            optimizer=optimizer,
+            lr_scheduler=lr_scheduler,
+            load_ema=False,
+            resume_optimizer=True,
+            resume_lr_scheduler=True
+        )
+        logger.warning(f'Missing keys: {missing}')
+        logger.warning(f'Unexpected keys: {unexpected}')
+        logger.info(f"Resumed from epoch {start_epoch}")
 
     # ============================================
     # Training Loop
@@ -182,18 +222,23 @@ def train():
 
     time_start, last_tic = time.time(), time.time()
     log_buffer = LogBuffer()
-    data_time_all = 0
+
+    grad_norm = None
+    global_step = start_epoch * len(train_dataloader)
+    total_steps = len(train_dataloader) * config.num_epochs
 
     for epoch in range(start_epoch, config.num_epochs):
         model.train()
+        data_time_all = 0
 
         for step, batch in enumerate(train_dataloader):
+            data_time_start = time.time()
+
             # Unpack batch
             layers, captions, num_layers, image_ids = batch
             layers = layers.to(accelerator.device)
             num_layers = num_layers.to(accelerator.device)
 
-            data_time_start = last_tic
             data_time_all += time.time() - data_time_start
 
             B = layers.shape[0]  # Batch size
@@ -214,11 +259,15 @@ def train():
                 layers_flat = layers_rgb.reshape(B * N, 3, H, W)
 
                 # VAE encode
-                z_flat = vae.encode(layers_flat).latent_dist.mode() * 0.18215
+                scale_factor = getattr(config, 'scale_factor', 0.18215)
+                z_flat = vae.encode(layers_flat).latent_dist.mode() * scale_factor
                 # (B*N, 4, h, w)
 
                 # Reshape back: (B*N, 4, h, w) → (B, N, 4, h, w)
                 z_clean = z_flat.reshape(B, N, 4, h, w)
+
+                # Memory optimization
+                torch.cuda.empty_cache()
 
             # ========================================
             # Random layer masking (exactly 1 layer)
@@ -306,32 +355,37 @@ def train():
 
                 # Gradient clipping
                 if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(model.parameters(), config.gradient_clip)
+                    grad_norm = accelerator.clip_grad_norm_(model.parameters(), config.gradient_clip)
 
                 optimizer.step()
+                lr_scheduler.step()
+
+                # Update EMA model
+                if accelerator.sync_gradients:
+                    ema_rate = getattr(config, 'ema_rate', 0.9999)
+                    ema_update(model_ema, model, ema_rate)
 
             # ========================================
             # Logging
             # ========================================
-            lr = optimizer.param_groups[0]['lr']
-            logs = {'loss': masked_loss.item()}
+            lr = lr_scheduler.get_last_lr()[0]
+            logs = {'loss': accelerator.gather(masked_loss).mean().item()}
+            if grad_norm is not None:
+                logs.update(grad_norm=accelerator.gather(grad_norm).mean().item())
             log_buffer.update(logs)
-
-            global_step += 1
 
             # Log every N steps
             if (step + 1) % config.log_interval == 0 or (step + 1) == 1:
                 t = (time.time() - last_tic) / config.log_interval
                 t_d = data_time_all / config.log_interval
                 avg_time = (time.time() - time_start) / (global_step + 1)
-                total_steps = len(train_dataloader) * config.num_epochs
                 start_step = start_epoch * len(train_dataloader)
                 eta = str(datetime.timedelta(seconds=int(avg_time * (total_steps - start_step - global_step - 1))))
                 eta_epoch = str(datetime.timedelta(seconds=int(avg_time * (len(train_dataloader) - step - 1))))
 
                 log_buffer.average()
 
-                info = f"Step/Epoch [{global_step}/{epoch}][{step + 1}/{len(train_dataloader)}]: " \
+                info = f"Step/Epoch [{global_step + 1}/{epoch}][{step + 1}/{len(train_dataloader)}]: " \
                        f"total_eta: {eta}, epoch_eta: {eta_epoch}, time_all: {t:.3f}, time_data: {t_d:.3f}, " \
                        f"lr: {lr:.3e}, "
                 info += ', '.join([f"{k}: {v:.4f}" for k, v in log_buffer.output.items()])
@@ -341,23 +395,49 @@ def train():
                 log_buffer.clear()
                 data_time_all = 0
 
+            global_step += 1
+
+            # Memory optimization: periodic cache cleanup every 10 steps
+            if (step + 1) % 10 == 0:
+                gc.collect()
+                torch.cuda.empty_cache()
+
+            # ========================================
+            # Save checkpoint (by steps)
+            # ========================================
+            save_model_steps = getattr(config, 'save_model_steps', None)
+            if save_model_steps is not None and global_step % save_model_steps == 0:
+                accelerator.wait_for_everyone()
+                if accelerator.is_main_process:
+                    os.umask(0o000)
+                    save_checkpoint(
+                        os.path.join(config.work_dir, 'checkpoints'),
+                        epoch=epoch,
+                        step=global_step,
+                        model=accelerator.unwrap_model(model),
+                        model_ema=accelerator.unwrap_model(model_ema),
+                        optimizer=optimizer,
+                        lr_scheduler=lr_scheduler
+                    )
+                    logger.info(f"Saved checkpoint at step {global_step}")
+
         # ========================================
-        # Save checkpoint
+        # Save checkpoint (by epochs)
         # ========================================
-        if accelerator.is_main_process and (epoch + 1) % config.save_model_epochs == 0:
-            save_path = os.path.join(
-                config.work_dir,
-                'checkpoints',
-                f'epoch_{epoch + 1}_step_{global_step}.pth'
-            )
-            accelerator.save({
-                'model': accelerator.unwrap_model(model).state_dict(),
-                'optimizer': optimizer.state_dict(),
-                'epoch': epoch + 1,
-                'global_step': global_step,
-                'config': args.config,
-            }, save_path)
-            logger.info(f"Saved checkpoint: {save_path}")
+        if (epoch + 1) % config.save_model_epochs == 0 or (epoch + 1) == config.num_epochs:
+            accelerator.wait_for_everyone()
+            if accelerator.is_main_process:
+                os.umask(0o000)
+                save_checkpoint(
+                    os.path.join(config.work_dir, 'checkpoints'),
+                    epoch=epoch + 1,
+                    step=global_step,
+                    model=accelerator.unwrap_model(model),
+                    model_ema=accelerator.unwrap_model(model_ema),
+                    optimizer=optimizer,
+                    lr_scheduler=lr_scheduler
+                )
+                logger.info(f"Saved checkpoint at epoch {epoch + 1}")
 
     logger.info("Training finished!")
 
