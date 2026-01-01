@@ -13,11 +13,14 @@ from torchvision import transforms
 from PIL import Image
 from diffusers.models import AutoencoderKL
 from tqdm import tqdm
+import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from diffusion.model.nets.PixArt_layer_inpainting import PixArtLayerInpainting
+from diffusion.model.nets.PixArt import PixArt_XL_2
 from diffusion.model.t5 import T5Embedder
+from diffusion import IDDPM
 
 
 def load_image(path, size=256):
@@ -32,9 +35,74 @@ def load_image(path, size=256):
 
 
 @torch.no_grad()
+def ddim_sample_step(
+    model,
+    x_t,
+    t,
+    t_next,
+    y,
+    y_mask,
+    layer_mask,
+    alphas_cumprod,
+    cfg_scale,
+    clean_layers
+):
+    """Single DDIM sampling step with CFG"""
+    B = x_t.shape[0]
+
+    # Prepare timesteps
+    t_batch = torch.full((B,), t, device=x_t.device, dtype=torch.long)
+
+    # CFG: conditional + unconditional
+    x_in = torch.cat([x_t, x_t], dim=0)
+    t_in = torch.cat([t_batch, t_batch], dim=0)
+    mask_in = torch.cat([layer_mask, layer_mask], dim=0)
+
+    # Get null text embedding
+    null_y = model.y_embedder.y_embedding.unsqueeze(0).unsqueeze(0).expand(B, 1, -1, -1)
+    null_y = null_y.to(y.device).to(y.dtype)
+    y_in = torch.cat([y, null_y], dim=0)
+
+    # Text mask
+    if y_mask is not None:
+        null_mask = torch.zeros(B, y_mask.shape[1], device=y_mask.device, dtype=y_mask.dtype)
+        text_mask_in = torch.cat([y_mask, null_mask], dim=0)
+    else:
+        text_mask_in = None
+
+    # Predict noise
+    noise_pred = model(x_in, mask_in, t_in, y_in, mask=text_mask_in)
+
+    # CFG
+    noise_pred_cond, noise_pred_uncond = noise_pred.chunk(2, dim=0)
+    noise_pred = noise_pred_uncond + cfg_scale * (noise_pred_cond - noise_pred_uncond)
+
+    # Get alpha values
+    alpha_t = alphas_cumprod[t]
+    alpha_next = alphas_cumprod[t_next] if t_next >= 0 else torch.tensor(1.0, device=x_t.device)
+
+    # DDIM update
+    # Predict x0
+    x0_pred = (x_t - torch.sqrt(1 - alpha_t) * noise_pred) / torch.sqrt(alpha_t)
+
+    # Direction pointing to x_t
+    dir_xt = torch.sqrt(1 - alpha_next) * noise_pred
+
+    # Next sample
+    x_next = torch.sqrt(alpha_next) * x0_pred + dir_xt
+
+    # Keep visible layers clean (only update masked layer)
+    layer_mask_expanded = layer_mask.view(B, -1, 1, 1, 1)
+    x_next = x_next * layer_mask_expanded + clean_layers * (1 - layer_mask_expanded)
+
+    return x_next
+
+
+@torch.no_grad()
 def inpaint_layer(
     model,
     vae,
+    diffusion,
     visible_layers,
     masked_idx,
     prompt,
@@ -50,6 +118,7 @@ def inpaint_layer(
     Args:
         model: PixArtLayerInpainting model
         vae: VAE model
+        diffusion: IDDPM diffusion for noise schedule
         visible_layers: List of (3, H, W) tensors - visible layer images
         masked_idx: int - index where to generate the layer
         prompt: str - text prompt for the masked layer
@@ -79,7 +148,7 @@ def inpaint_layer(
         visible_latents.append(z.squeeze(0))
 
     # Build full layer set with padding
-    layers = torch.zeros(1, max_layers, 4, h, w, device=device)
+    clean_layers = torch.zeros(1, max_layers, 4, h, w, device=device)
     layer_mask = torch.zeros(1, max_layers, device=device)
 
     # Place visible layers
@@ -90,86 +159,55 @@ def inpaint_layer(
             layer_mask[0, i] = 1
         elif visible_idx < num_visible:
             # Place visible layer
-            layers[0, i] = visible_latents[visible_idx]
+            clean_layers[0, i] = visible_latents[visible_idx]
             visible_idx += 1
         # else: keep as zero (black padding)
-
-    # Initialize masked layer with noise
-    layers[0, masked_idx] = torch.randn(4, h, w, device=device)
 
     # Encode text
     caption_embs, emb_masks = text_encoder.get_text_embeddings([prompt])
     y = caption_embs.float()[:, None].to(device)
     y_mask = emb_masks.to(device)
 
-    # Build DDIM schedule
-    betas = torch.linspace(0.0001, 0.02, 1000)
-    alphas = 1.0 - betas
-    alphas_cumprod = torch.cumprod(alphas, dim=0).to(device)
+    # Get alpha schedule from IDDPM
+    alphas_cumprod = torch.from_numpy(diffusion.alphas_cumprod).float().to(device)
 
+    # DDIM timestep schedule
     timesteps = torch.linspace(999, 0, steps + 1, dtype=torch.long, device=device)
 
-    # DDIM sampling
-    x_t = layers.clone()
+    # Initialize masked layer with random noise
+    x_t = clean_layers.clone()
+    x_t[0, masked_idx] = torch.randn(4, h, w, device=device)
 
+    # DDIM sampling loop
     for i in tqdm(range(steps), desc="Inpainting"):
-        t = timesteps[i]
-        t_next = timesteps[i + 1]
-        t_batch = t.expand(1)
+        t = timesteps[i].item()
+        t_next = timesteps[i + 1].item()
 
-        # CFG
-        x_in = torch.cat([x_t, x_t], dim=0)
-        t_in = torch.cat([t_batch, t_batch], dim=0)
-
-        # Null text embedding
-        null_y = model.y_embedder.y_embedding.unsqueeze(0).unsqueeze(0)
-        null_y = null_y.to(y.device).to(y.dtype)
-        y_in = torch.cat([y, null_y], dim=0)
-
-        # Mask
-        mask_in = torch.cat([layer_mask, layer_mask], dim=0)
-
-        # Text mask
-        if y_mask is not None:
-            null_mask = torch.ones(1, y_mask.shape[1], device=y_mask.device, dtype=y_mask.dtype)
-            text_mask_in = torch.cat([y_mask, null_mask], dim=0)
-        else:
-            text_mask_in = None
-
-        # Predict noise
-        noise_pred = model(x_in, mask_in, t_in, y_in, mask=text_mask_in)
-
-        # CFG
-        noise_pred_cond, noise_pred_uncond = noise_pred.chunk(2, dim=0)
-        noise_pred = noise_pred_uncond + cfg_scale * (noise_pred_cond - noise_pred_uncond)
-
-        # DDIM step
-        alpha_t = alphas_cumprod[t]
-        alpha_next = alphas_cumprod[t_next] if t_next >= 0 else torch.tensor(1.0, device=device)
-
-        # Predict x0
-        x0_pred = (x_t - torch.sqrt(1 - alpha_t) * noise_pred) / torch.sqrt(alpha_t)
-
-        # Next step
-        x_next = torch.sqrt(alpha_next) * x0_pred + torch.sqrt(1 - alpha_next) * noise_pred
-
-        # Update only masked layer (keep visible layers clean)
-        layer_mask_expanded = layer_mask.view(1, max_layers, 1, 1, 1)
-        x_t = x_next * layer_mask_expanded + layers * (1 - layer_mask_expanded)
+        x_t = ddim_sample_step(
+            model=model,
+            x_t=x_t,
+            t=t,
+            t_next=t_next,
+            y=y,
+            y_mask=y_mask,
+            layer_mask=layer_mask,
+            alphas_cumprod=alphas_cumprod,
+            cfg_scale=cfg_scale,
+            clean_layers=clean_layers
+        )
 
     # Decode generated layer
     z_generated = x_t[0, masked_idx:masked_idx+1] / 0.18215
     img_generated = vae.decode(z_generated).sample[0]
 
-    # Decode all layers
+    # Decode all layers for visualization
     all_imgs = []
     for i in range(max_layers):
-        if layer_mask[0, i] == 0 and i < num_visible + 1:  # Visible or generated
-            z = x_t[0, i:i+1] / 0.18215
-            img = vae.decode(z).sample[0]
-            all_imgs.append(img)
+        z = x_t[0, i:i+1] / 0.18215
+        img = vae.decode(z).sample[0]
+        all_imgs.append(img)
 
-    all_imgs = torch.stack(all_imgs, dim=0) if all_imgs else None
+    all_imgs = torch.stack(all_imgs, dim=0)
 
     return img_generated, all_imgs
 
@@ -201,14 +239,27 @@ def main():
     print("="*60)
 
     # Load models
-    print("\n[1/4] Loading models...")
+    print("\n[1/5] Loading models...")
 
+    # Create pretrained PixArt (needed for proper initialization)
+    print("  - Creating PixArt backbone...")
+    pretrained_pixart = PixArt_XL_2(
+        input_size=args.image_size // 8,
+        in_channels=4,
+        caption_channels=4096,
+        model_max_length=120,
+        pred_sigma=True,
+    )
+
+    # Create layer inpainting model
     model = PixArtLayerInpainting(
+        pretrained_pixart=pretrained_pixart,
         max_layers=args.max_layers,
         input_size=args.image_size // 8,
         pred_sigma=True,
     ).to(device).eval()
 
+    # Load checkpoint
     ckpt = torch.load(args.checkpoint, map_location='cpu')
     # Try to load EMA model first (better quality), fallback to regular model
     if 'state_dict_ema' in ckpt:
@@ -222,16 +273,22 @@ def main():
         print(f"  ✓ Using checkpoint as-is")
 
     model.load_state_dict(state_dict, strict=False)
-    print(f"  ✓ Model loaded")
+    print(f"  ✓ Model loaded from {args.checkpoint}")
 
+    # Load VAE
     vae = AutoencoderKL.from_pretrained(args.vae_path).to(device).eval()
     print(f"  ✓ VAE loaded")
 
+    # Load T5
     t5 = T5Embedder(device=device, local_cache=True, cache_dir=args.t5_path, torch_dtype=torch.float16)
     print(f"  ✓ T5 loaded")
 
+    # Create diffusion for noise schedule
+    diffusion = IDDPM(str(1000))
+    print(f"  ✓ Diffusion created")
+
     # Load visible layers
-    print("\n[2/4] Loading visible layers...")
+    print("\n[2/5] Loading visible layers...")
     visible_layers = []
     for path in args.visible_layers:
         img = load_image(path, args.image_size)
@@ -239,10 +296,11 @@ def main():
         print(f"  ✓ {path}")
 
     # Generate
-    print("\n[3/4] Generating masked layer...")
+    print("\n[3/5] Generating masked layer...")
     generated, all_layers = inpaint_layer(
         model=model,
         vae=vae,
+        diffusion=diffusion,
         visible_layers=visible_layers,
         masked_idx=args.masked_idx,
         prompt=args.prompt,
@@ -254,7 +312,7 @@ def main():
     )
 
     # Save
-    print("\n[4/4] Saving results...")
+    print("\n[4/5] Saving results...")
     os.makedirs(os.path.dirname(args.output) or '.', exist_ok=True)
 
     save_image(generated, args.output, normalize=True, value_range=(-1, 1))
