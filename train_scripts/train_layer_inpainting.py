@@ -187,65 +187,35 @@ def train():
     for epoch in range(start_epoch, config.num_epochs):
         model.train()
 
-        for step, batch_list in enumerate(train_dataloader):
-            # batch_list is a list of dict, each with variable number of layers
+        for step, batch in enumerate(train_dataloader):
+            # Unpack batch
+            layers, captions, num_layers, image_ids = batch
+            layers = layers.to(accelerator.device)
+            num_layers = num_layers.to(accelerator.device)
+
             data_time_start = last_tic
             data_time_all += time.time() - data_time_start
 
-            # ========================================
-            # Process batch with variable layers
-            # ========================================
-            B = len(batch_list)
+            B = layers.shape[0]  # Batch size
+            N = layers.shape[1]  # max_layers
             max_layers = config.max_layers
             H, W = config.image_size, config.image_size
             h, w = H // 8, W // 8
-
-            # Collect layers and captions
-            all_layers = []  # List of (N_i, 3, H, W)
-            all_captions = []  # List of List[str]
-            all_num_layers = []  # List of int
-
-            for item in batch_list:
-                layers = item['layers']  # (N_i, 3, H, W)
-                captions = item['captions']  # List[str], length N_i
-                num_layers = item['num_layers']  # int
-
-                # Random shuffle layers (order doesn't matter)
-                perm = torch.randperm(num_layers)
-                layers = layers[perm]
-                captions = [captions[i] for i in perm]
-
-                all_layers.append(layers)
-                all_captions.append(captions)
-                all_num_layers.append(num_layers)
 
             # ========================================
             # Encode to VAE latent with padding
             # ========================================
             with torch.no_grad():
-                z_all = []
+                # layers: (B, N, 3, H, W)
+                # Flatten: (B, N, 3, H, W) → (B*N, 3, H, W)
+                layers_flat = layers.reshape(B * N, 3, H, W)
 
-                for b in range(B):
-                    layers = all_layers[b]  # (N_i, 3, H, W)
-                    num_layers = all_num_layers[b]
+                # VAE encode
+                z_flat = vae.encode(layers_flat).latent_dist.mode() * 0.18215
+                # (B*N, 4, h, w)
 
-                    # Encode existing layers
-                    layers_device = layers.to(accelerator.device)
-                    z = vae.encode(layers_device).latent_dist.mode() * 0.18215
-                    # (N_i, 4, h, w)
-
-                    # Pad to max_layers with zeros (black)
-                    if num_layers < max_layers:
-                        padding = torch.zeros(
-                            max_layers - num_layers, 4, h, w,
-                            device=z.device, dtype=z.dtype
-                        )
-                        z = torch.cat([z, padding], dim=0)
-
-                    z_all.append(z)
-
-                # Stack: (B, max_layers, 4, h, w)
-                z_clean = torch.stack(z_all, dim=0)
+                # Reshape back: (B*N, 4, h, w) → (B, N, 4, h, w)
+                z_clean = z_flat.reshape(B, N, 4, h, w)
 
             # ========================================
             # Random layer masking (exactly 1 layer)
@@ -254,13 +224,14 @@ def train():
             masked_captions = []
 
             for b in range(B):
-                num_layers = all_num_layers[b]
+                # num_layers[b] is the actual number of valid layers for this sample
+                n_valid = num_layers[b].item()
                 # Randomly select ONE layer to mask (from valid layers only)
-                masked_idx = random.randint(0, num_layers - 1)
+                masked_idx = random.randint(0, n_valid - 1)
                 layer_mask[b, masked_idx] = 1
 
                 # Use the masked layer's caption
-                masked_captions.append(all_captions[b][masked_idx])
+                masked_captions.append(captions[b][masked_idx])
 
             # ========================================
             # Sample timesteps
