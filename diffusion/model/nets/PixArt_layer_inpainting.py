@@ -126,16 +126,8 @@ class PixArtLayerInpainting(nn.Module):
             self.pixart.enable_gradient_checkpointing()
         elif hasattr(self.pixart, 'gradient_checkpointing_enable'):
             self.pixart.gradient_checkpointing_enable()
-        else:
-            # Manual gradient checkpointing setup
-            def make_checkpoint(module):
-                def custom_forward(*inputs):
-                    return module(*inputs)
-                return custom_forward
-
-            if hasattr(self.pixart, 'blocks'):
-                for block in self.pixart.blocks:
-                    block.forward = make_checkpoint(block)
+        # If neither method exists, gradient checkpointing is not supported
+        # Don't manually implement it as it can cause recursion issues
 
 
 def load_pretrained_pixart(checkpoint_path, input_size=32):
