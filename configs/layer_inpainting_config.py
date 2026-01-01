@@ -9,9 +9,9 @@ pred_sigma = True
 model_max_length = 120
 
 # Data
-data_root = [
-    '../data/mulan_coco/meta_data.csv',
-    '../data/mulan_laion/meta_data.csv',
+data_roots = [
+    '../data/mulan_coco',
+    '../data/mulan_laion',
 ]
 caption_type = 'blip2'  # or 't5', 'blip2'
 

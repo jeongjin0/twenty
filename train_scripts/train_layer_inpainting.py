@@ -23,7 +23,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from diffusion.model.nets.PixArt_layer_inpainting import PixArtLayerInpainting, load_pretrained_pixart
 from diffusion.model.t5 import T5Embedder
 from diffusion.iddpm import IDDPM
-from dataset.mulan_dataset import MuLanDataset
+from diffusion.data.multilayer_builder import build_mulan_dataloader
 from tools.logger import get_root_logger
 from tools.train_utils import (
     AverageMeter,
@@ -45,12 +45,6 @@ def read_config(config_path):
     config = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(config)
     return config
-
-
-def collate_fn(batch):
-    """Custom collate function for variable number of layers"""
-    # Each item: {'layers': (N, 3, H, W), 'captions': List[str], 'num_layers': int}
-    return batch
 
 
 def train():
@@ -124,25 +118,18 @@ def train():
     # ============================================
     logger.info("Loading dataset...")
 
-    dataset = MuLanDataset(
-        csv_files=config.data_root,
+    train_dataloader = build_mulan_dataloader(
+        data_roots=config.data_roots,
+        batch_size=config.batch_size,
         resolution=config.image_size,
         max_layers=config.max_layers,
-        caption_type=config.caption_type,
-    )
-
-    dataloader = DataLoader(
-        dataset,
-        batch_size=config.batch_size,
-        shuffle=True,
         num_workers=config.num_workers,
-        collate_fn=collate_fn,
-        pin_memory=True,
+        shuffle=True,
+        caption_type=getattr(config, 'caption_type', 'blip2')
     )
 
-    logger.info(f"Dataset size: {len(dataset)}")
     logger.info(f"Batch size: {config.batch_size}")
-    logger.info(f"Total steps per epoch: {len(dataloader)}")
+    logger.info(f"Total steps per epoch: {len(train_dataloader)}")
 
     # ============================================
     # VAE & Text Encoder
@@ -178,7 +165,7 @@ def train():
     # ============================================
     # Prepare with Accelerator
     # ============================================
-    model, optimizer, dataloader = accelerator.prepare(model, optimizer, dataloader)
+    model, optimizer, train_dataloader = accelerator.prepare(model, optimizer, train_dataloader)
 
     # ============================================
     # Resume from checkpoint
@@ -207,7 +194,7 @@ def train():
     for epoch in range(start_epoch, config.num_epochs):
         model.train()
 
-        for step, batch_list in enumerate(dataloader):
+        for step, batch_list in enumerate(train_dataloader):
             # batch_list is a list of dict, each with variable number of layers
             data_time_start = last_tic
             data_time_all += time.time() - data_time_start
@@ -372,11 +359,11 @@ def train():
                 t_d = data_time_all
                 avg_time = log_buffer.meters['loss'].avg_time if hasattr(log_buffer.meters['loss'], 'avg_time') else t
 
-                eta_epoch = str(datetime.timedelta(seconds=int(avg_time * (len(dataloader) - step - 1))))
+                eta_epoch = str(datetime.timedelta(seconds=int(avg_time * (len(train_dataloader) - step - 1))))
 
                 log_buffer.average()
 
-                info = f"Step/Epoch [{global_step}/{epoch}][{step + 1}/{len(dataloader)}]: " \
+                info = f"Step/Epoch [{global_step}/{epoch}][{step + 1}/{len(train_dataloader)}]: " \
                        f"epoch_eta: {eta_epoch}, time: {t:.3f}, time_data: {t_d:.3f}, " \
                        f"lr: {lr:.3e}, "
                 info += ', '.join([f"{k}: {v:.4f}" for k, v in log_buffer.output.items()])
