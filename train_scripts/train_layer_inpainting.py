@@ -307,15 +307,18 @@ def train():
             with accelerator.accumulate(model):
                 optimizer.zero_grad()
 
-                # Forward diffusion: add noise
+                # Forward diffusion: add noise using q_sample
                 noise = torch.randn_like(z_clean)
-                sqrt_alphas_cumprod = diffusion._extract_into_tensor(
-                    diffusion.sqrt_alphas_cumprod, timesteps, z_clean.shape
-                )
-                sqrt_one_minus_alphas_cumprod = diffusion._extract_into_tensor(
-                    diffusion.sqrt_one_minus_alphas_cumprod, timesteps, z_clean.shape
-                )
-                z_noisy = sqrt_alphas_cumprod * z_clean + sqrt_one_minus_alphas_cumprod * noise
+
+                # Apply q_sample to all layers
+                # Need to flatten to (B*N, 4, h, w) for q_sample
+                B, N, C, h, w = z_clean.shape
+                z_clean_flat = z_clean.reshape(B * N, C, h, w)
+                noise_flat = noise.reshape(B * N, C, h, w)
+                timesteps_expanded = timesteps.unsqueeze(1).expand(B, N).reshape(B * N)
+
+                z_noisy_flat = diffusion.q_sample(z_clean_flat, timesteps_expanded, noise=noise_flat)
+                z_noisy = z_noisy_flat.reshape(B, N, C, h, w)
 
                 # Replace visible layers with clean latents
                 layer_mask_expanded = layer_mask.view(B, max_layers, 1, 1, 1)
