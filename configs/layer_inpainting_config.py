@@ -32,7 +32,10 @@ optimizer = dict(
 )
 
 # LR Scheduler
-lr_scheduler = 'constant'
+lr_schedule = 'constant'
+lr_schedule_args = dict(
+    num_warmup_steps=0,  # No warmup for constant schedule
+)
 
 # EMA
 ema_rate = 0.9999
