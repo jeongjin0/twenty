@@ -2,49 +2,34 @@
 Training script for Layer-wise Inpainting
 """
 
+import argparse
+import datetime
 import os
 import sys
 import time
-import datetime
 import random
-import argparse
+import warnings
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
-import numpy as np
-from tqdm import tqdm
 from diffusers.models import AutoencoderKL
+from mmcv.runner import LogBuffer
 
 # Add parent directory to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+os.environ['NCCL_P2P_DISABLE'] = '1'
 
 from diffusion.model.nets.PixArt_layer_inpainting import PixArtLayerInpainting, load_pretrained_pixart
 from diffusion.model.t5 import T5Embedder
-from diffusion.iddpm import IDDPM
+from diffusion import IDDPM
 from diffusion.data.multilayer_builder import build_mulan_dataloader
-from tools.logger import get_root_logger
-from tools.train_utils import (
-    AverageMeter,
-    DebugUnderflowOverflow,
-)
+from diffusion.utils.logger import get_root_logger
+from diffusion.utils.misc import set_random_seed, read_config, DebugUnderflowOverflow
+from accelerate import Accelerator, InitProcessGroupKwargs
 
-try:
-    from accelerate import Accelerator
-    from accelerate.utils import set_seed
-except ImportError:
-    print("Please install accelerate: pip install accelerate")
-    sys.exit(1)
-
-
-def read_config(config_path):
-    """Read config file"""
-    import importlib.util
-    spec = importlib.util.spec_from_file_location("config", config_path)
-    config = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(config)
-    return config
+warnings.filterwarnings("ignore")
 
 
 def train():
@@ -58,14 +43,15 @@ def train():
     config = read_config(args.config)
 
     # Initialize accelerator
+    kwargs = InitProcessGroupKwargs(timeout=datetime.timedelta(seconds=7200))
     accelerator = Accelerator(
-        gradient_accumulation_steps=getattr(config, 'gradient_accumulation_steps', 1),
         mixed_precision=getattr(config, 'mixed_precision', 'fp16'),
+        gradient_accumulation_steps=getattr(config, 'gradient_accumulation_steps', 1),
+        kwargs_handlers=[kwargs],
     )
 
     # Set seed
-    if accelerator.is_main_process:
-        set_seed(getattr(config, 'seed', 42))
+    set_random_seed(getattr(config, 'seed', 42))
 
     # Logger
     logger = get_root_logger(
@@ -187,9 +173,13 @@ def train():
     # ============================================
     logger.info("Starting training...")
 
-    log_buffer = AverageMeter()
+    if getattr(config, 'debug_nan', False):
+        DebugUnderflowOverflow(model)
+        logger.info('NaN debugger registered. Start to detect overflow during training.')
+
+    time_start, last_tic = time.time(), time.time()
+    log_buffer = LogBuffer()
     data_time_all = 0
-    last_tic = time.time()
 
     for epoch in range(start_epoch, config.num_epochs):
         model.train()
@@ -348,23 +338,26 @@ def train():
             # ========================================
             # Logging
             # ========================================
-            log_buffer.update({'loss': masked_loss.item()})
+            lr = optimizer.param_groups[0]['lr']
+            logs = {'loss': masked_loss.item()}
+            log_buffer.update(logs)
 
             global_step += 1
 
             # Log every N steps
-            if step % config.log_interval == 0 and step > 0:
-                lr = optimizer.param_groups[0]['lr']
-                t = time.time() - last_tic
-                t_d = data_time_all
-                avg_time = log_buffer.meters['loss'].avg_time if hasattr(log_buffer.meters['loss'], 'avg_time') else t
-
+            if (step + 1) % config.log_interval == 0 or (step + 1) == 1:
+                t = (time.time() - last_tic) / config.log_interval
+                t_d = data_time_all / config.log_interval
+                avg_time = (time.time() - time_start) / (global_step + 1)
+                total_steps = len(train_dataloader) * config.num_epochs
+                start_step = start_epoch * len(train_dataloader)
+                eta = str(datetime.timedelta(seconds=int(avg_time * (total_steps - start_step - global_step - 1))))
                 eta_epoch = str(datetime.timedelta(seconds=int(avg_time * (len(train_dataloader) - step - 1))))
 
                 log_buffer.average()
 
                 info = f"Step/Epoch [{global_step}/{epoch}][{step + 1}/{len(train_dataloader)}]: " \
-                       f"epoch_eta: {eta_epoch}, time: {t:.3f}, time_data: {t_d:.3f}, " \
+                       f"total_eta: {eta}, epoch_eta: {eta_epoch}, time_all: {t:.3f}, time_data: {t_d:.3f}, " \
                        f"lr: {lr:.3e}, "
                 info += ', '.join([f"{k}: {v:.4f}" for k, v in log_buffer.output.items()])
                 logger.info(info)
