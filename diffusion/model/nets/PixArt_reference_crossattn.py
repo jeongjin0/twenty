@@ -530,14 +530,24 @@ class ReferencePixArtCrossAttn(nn.Module):
         # Shape: (B, L + N_ref*T_comp, D)
         cond_tokens = torch.cat([y, ref_tokens], dim=1)
 
+        # Extend mask to cover reference tokens (references are always valid)
+        if mask is not None:
+            # mask is (B, L) for text tokens
+            # Create mask for reference tokens (all ones since they're always valid)
+            ref_mask = torch.ones(B, ref_tokens.shape[1], device=mask.device, dtype=mask.dtype)
+            # Concatenate: (B, L + N_ref*T_comp)
+            extended_mask = torch.cat([mask, ref_mask], dim=1)
+        else:
+            extended_mask = None
+
         # 6. Transformer blocks with combined cross-attention
         if self.gradient_checkpointing and self.training:
             from torch.utils.checkpoint import checkpoint
             for block in self.blocks:
-                x = checkpoint(block, x, cond_tokens, t0, None, use_reentrant=False)
+                x = checkpoint(block, x, cond_tokens, t0, extended_mask, use_reentrant=False)
         else:
             for block in self.blocks:
-                x = block(x, cond_tokens, t0)
+                x = block(x, cond_tokens, t0, extended_mask)
 
         # 7. Final layer
         x = self.final_layer(x, t)
