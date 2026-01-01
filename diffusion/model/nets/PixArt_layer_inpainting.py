@@ -120,6 +120,23 @@ class PixArtLayerInpainting(nn.Module):
         """Get model dtype"""
         return next(self.parameters()).dtype
 
+    def enable_gradient_checkpointing(self):
+        """Enable gradient checkpointing for the underlying PixArt model"""
+        if hasattr(self.pixart, 'enable_gradient_checkpointing'):
+            self.pixart.enable_gradient_checkpointing()
+        elif hasattr(self.pixart, 'gradient_checkpointing_enable'):
+            self.pixart.gradient_checkpointing_enable()
+        else:
+            # Manual gradient checkpointing setup
+            def make_checkpoint(module):
+                def custom_forward(*inputs):
+                    return module(*inputs)
+                return custom_forward
+
+            if hasattr(self.pixart, 'blocks'):
+                for block in self.pixart.blocks:
+                    block.forward = make_checkpoint(block)
+
 
 def load_pretrained_pixart(checkpoint_path, input_size=32):
     """Load pretrained PixArt model"""

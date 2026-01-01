@@ -99,7 +99,7 @@ def train():
 
     # Enable gradient checkpointing
     if getattr(config, 'gradient_checkpointing', False):
-        model.pixart.enable_gradient_checkpointing()
+        model.enable_gradient_checkpointing()
         logger.info("Gradient checkpointing enabled")
 
     # ============================================
