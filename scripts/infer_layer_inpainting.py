@@ -210,8 +210,18 @@ def main():
     ).to(device).eval()
 
     ckpt = torch.load(args.checkpoint, map_location='cpu')
-    state_dict = ckpt.get('model', ckpt)
-    model.load_state_dict(state_dict, strict=True)
+    # Try to load EMA model first (better quality), fallback to regular model
+    if 'state_dict_ema' in ckpt:
+        state_dict = ckpt['state_dict_ema']
+        print(f"  ✓ Using EMA model")
+    elif 'state_dict' in ckpt:
+        state_dict = ckpt['state_dict']
+        print(f"  ✓ Using regular model")
+    else:
+        state_dict = ckpt
+        print(f"  ✓ Using checkpoint as-is")
+
+    model.load_state_dict(state_dict, strict=False)
     print(f"  ✓ Model loaded")
 
     vae = AutoencoderKL.from_pretrained(args.vae_path).to(device).eval()
