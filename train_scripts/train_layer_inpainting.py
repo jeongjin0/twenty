@@ -53,6 +53,11 @@ def train():
     # Set seed
     set_random_seed(getattr(config, 'seed', 42))
 
+    # Create work directory first
+    if accelerator.is_main_process:
+        os.makedirs(config.work_dir, exist_ok=True)
+        os.makedirs(os.path.join(config.work_dir, 'checkpoints'), exist_ok=True)
+
     # Logger
     logger = get_root_logger(
         log_file=os.path.join(config.work_dir, 'train.log') if accelerator.is_main_process else None,
@@ -62,8 +67,6 @@ def train():
     if accelerator.is_main_process:
         logger.info(f"Config: {args.config}")
         logger.info(f"Working directory: {config.work_dir}")
-        os.makedirs(config.work_dir, exist_ok=True)
-        os.makedirs(os.path.join(config.work_dir, 'checkpoints'), exist_ok=True)
 
     # ============================================
     # Build Model
