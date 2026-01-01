@@ -237,31 +237,6 @@ def train():
                 masked_captions.append(captions[b][masked_idx])
 
             # ========================================
-            # Sample timesteps
-            # ========================================
-            timesteps = torch.randint(
-                0, config.train_sampling_steps, (B,),
-                device=accelerator.device
-            ).long()
-
-            # ========================================
-            # Add noise
-            # ========================================
-            noise = torch.randn_like(z_clean)
-
-            # Get alpha values
-            alpha_t = diffusion.iddpm.alphas_cumprod[timesteps]  # (B,)
-            alpha_t = alpha_t.view(B, 1, 1, 1, 1)
-
-            # Add noise to ALL layers
-            z_noisy = torch.sqrt(alpha_t) * z_clean + torch.sqrt(1 - alpha_t) * noise
-
-            # Replace visible layers with clean latents
-            # Only masked layer has noise
-            layer_mask_expanded = layer_mask.view(B, max_layers, 1, 1, 1)
-            z_input = z_noisy * layer_mask_expanded + z_clean * (1 - layer_mask_expanded)
-
-            # ========================================
             # Encode text (masked layer captions)
             # ========================================
             with torch.no_grad():
@@ -270,11 +245,34 @@ def train():
                 y_mask = emb_masks.to(accelerator.device)
 
             # ========================================
-            # Forward pass
+            # Sample timesteps
+            # ========================================
+            timesteps = torch.randint(
+                0, config.train_sampling_steps, (B,),
+                device=accelerator.device
+            ).long()
+
+            # ========================================
+            # Training step
             # ========================================
             with accelerator.accumulate(model):
                 optimizer.zero_grad()
 
+                # Forward diffusion: add noise
+                noise = torch.randn_like(z_clean)
+                sqrt_alphas_cumprod = diffusion._extract_into_tensor(
+                    diffusion.sqrt_alphas_cumprod, timesteps, z_clean.shape
+                )
+                sqrt_one_minus_alphas_cumprod = diffusion._extract_into_tensor(
+                    diffusion.sqrt_one_minus_alphas_cumprod, timesteps, z_clean.shape
+                )
+                z_noisy = sqrt_alphas_cumprod * z_clean + sqrt_one_minus_alphas_cumprod * noise
+
+                # Replace visible layers with clean latents
+                layer_mask_expanded = layer_mask.view(B, max_layers, 1, 1, 1)
+                z_input = z_noisy * layer_mask_expanded + z_clean * (1 - layer_mask_expanded)
+
+                # Predict noise
                 noise_pred = model(
                     layers=z_input,
                     layer_mask=layer_mask,
