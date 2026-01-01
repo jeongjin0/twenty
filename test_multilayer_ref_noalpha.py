@@ -57,7 +57,6 @@ def load_model_and_checkpoint(args, device):
             caption_channels=4096,
             model_max_length=config.model_max_length,
             pred_sigma=pred_sigma,
-            use_ref=True,
         ).to(device).eval()
     else:
         raise ValueError(f"Unknown model type: {args.model_type}")
@@ -79,6 +78,25 @@ def load_model_and_checkpoint(args, device):
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
     print(f"Missing keys: {len(missing)}")
     print(f"Unexpected keys: {len(unexpected)}")
+
+    # Debug: Check if ref_encoder weights are loaded
+    if hasattr(model, 'ref_encoder'):
+        print("\n[DEBUG] Checking ref_encoder weights:")
+        ref_encoder_keys = [k for k in state_dict.keys() if 'ref_encoder' in k]
+        print(f"  Found {len(ref_encoder_keys)} ref_encoder keys in checkpoint")
+        if ref_encoder_keys:
+            print(f"  Example keys: {ref_encoder_keys[:3]}")
+        else:
+            print("  WARNING: No ref_encoder keys found in checkpoint!")
+            print("  This means ref_encoder is using random initialization!")
+
+        # Check actual parameter stats
+        total_params = sum(p.numel() for p in model.ref_encoder.parameters())
+        print(f"  ref_encoder has {total_params:,} parameters")
+
+        # Check if parameters seem initialized or random
+        first_param = next(model.ref_encoder.parameters())
+        print(f"  First param stats: mean={first_param.mean().item():.6f}, std={first_param.std().item():.6f}")
 
     return model, config
 
@@ -102,31 +120,51 @@ def load_vae_and_t5(config, device):
     return vae, text_encoder
 
 
-def load_reference_images(dataloader, image_indices, num_refs, device):
+def load_reference_images(dataloader, image_idx, layer_indices, device):
     """
-    Load reference images from dataset by image IDs.
+    Load reference layers from a single image.
 
     Args:
         dataloader: MultiLayer dataloader
-        image_indices: List of image IDs to load
-        num_refs: Number of reference layers to use
+        image_idx: Dataset index of the image to load
+        layer_indices: List of layer indices to use as references (e.g., [0, 1, 2, 3])
         device: torch device
 
     Returns:
-        ref_images: (num_refs, 4, H, W) - latent space
+        ref_images: (num_layers, C, H, W) - reference images
+        ref_captions: List[str] - captions for each reference layer
     """
-    # This is a placeholder - you'll need to implement based on your dataset structure
-    # For now, just return random references from the first batch
+    dataset = dataloader.dataset
 
-    batch = next(iter(dataloader))
-    layers, captions, num_layers, image_ids = batch
-    layers = layers.to(device)
+    if image_idx >= len(dataset):
+        raise ValueError(f"Image index {image_idx} is out of bounds (dataset size: {len(dataset)})")
 
-    # Take first sample's layers as references
-    # Shape: (N, 3 or 4, H, W)
-    ref_images = layers[0, :num_refs]  # Take first num_refs layers
+    # Load one image with all its layers
+    layers, captions, num_layers, image_id = dataset[image_idx]
+    # layers: (max_layers, C, H, W)
 
-    return ref_images, captions[0][:num_refs]
+    # Get specified layers as references
+    all_ref_images = []
+    all_ref_captions = []
+
+    for layer_idx in layer_indices:
+        if layer_idx >= num_layers:
+            print(f"Warning: Layer {layer_idx} exceeds available layers ({num_layers}). Skipping.")
+            continue
+
+        ref_image = layers[layer_idx]  # (C, H, W)
+        ref_caption = captions[layer_idx]
+
+        all_ref_images.append(ref_image)
+        all_ref_captions.append(ref_caption)
+
+    if len(all_ref_images) == 0:
+        raise ValueError("No valid reference layers loaded!")
+
+    # Stack all references: (num_layers, C, H, W)
+    ref_images = torch.stack(all_ref_images, dim=0).to(device)
+
+    return ref_images, all_ref_captions
 
 
 def generate_with_references(
@@ -139,7 +177,8 @@ def generate_with_references(
     device,
     cfg_scale=4.5,
     steps=20,
-    scale_factor=0.18215
+    scale_factor=0.18215,
+    debug=False
 ):
     """
     Generate image with given prompt and references.
@@ -155,15 +194,66 @@ def generate_with_references(
         cfg_scale: Classifier-free guidance scale
         steps: Number of sampling steps
         scale_factor: VAE scale factor
+        debug: Print debug information
 
     Returns:
         generated_image: (3, H, W) in pixel space
         ref_images_decoded: (N, 3, H, W) in pixel space
     """
+    # Hook to capture intermediate values
+    ref_tokens_captured = {}
+    cond_tokens_captured = {}
+
+    def ref_encoder_hook(module, input, output):
+        ref_tokens_captured['output'] = output.detach()
+        if debug:
+            # Check input
+            input_tensor = input[0]
+            print(f"    [DEBUG] ref_encoder INPUT: shape={input_tensor.shape}, mean={input_tensor.mean().item():.6f}, std={input_tensor.std().item():.6f}")
+            print(f"    [DEBUG] ref_encoder OUTPUT: shape={output.shape}, mean={output.mean().item():.6f}, std={output.std().item():.6f}")
+
+    # Register hooks if model has ref_encoder
+    hook_handles = []
+    if hasattr(model, 'ref_encoder'):
+        hook_handles.append(model.ref_encoder.register_forward_hook(ref_encoder_hook))
+
+        # Add hooks for intermediate layers if debug mode
+        if debug and hasattr(model.ref_encoder, 'patch_embed'):
+            def patch_embed_hook(module, input, output):
+                print(f"    [DEBUG]   patch_embed OUTPUT: shape={output.shape}, mean={output.mean().item():.6f}, std={output.std().item():.6f}")
+            hook_handles.append(model.ref_encoder.patch_embed.register_forward_hook(patch_embed_hook))
+
+        if debug and hasattr(model.ref_encoder, 'spatial_compress'):
+            def spatial_compress_hook(module, input, output):
+                print(f"    [DEBUG]   spatial_compress OUTPUT: shape={output.shape}, mean={output.mean().item():.6f}, std={output.std().item():.6f}")
+            hook_handles.append(model.ref_encoder.spatial_compress.register_forward_hook(spatial_compress_hook))
+
+        if debug and hasattr(model.ref_encoder, 'output_proj'):
+            def output_proj_hook(module, input, output):
+                in_tensor = input[0]
+                print(f"    [DEBUG]   output_proj INPUT: shape={in_tensor.shape}, mean={in_tensor.mean().item():.6f}, std={in_tensor.std().item():.6f}")
+                print(f"    [DEBUG]   output_proj OUTPUT: shape={output.shape}, mean={output.mean().item():.6f}, std={output.std().item():.6f}")
+            hook_handles.append(model.ref_encoder.output_proj.register_forward_hook(output_proj_hook))
+
+        # Hook transformer blocks to find where collapse happens
+        if debug and hasattr(model.ref_encoder, 'blocks'):
+            for block_idx, block in enumerate(model.ref_encoder.blocks):
+                if block_idx == 0 or block_idx == len(model.ref_encoder.blocks) - 1:  # First and last block only
+                    def make_block_hook(idx):
+                        def block_hook(module, input, output):
+                            in_tensor = input[0] if isinstance(input, tuple) else input
+                            print(f"    [DEBUG]   transformer_block[{idx}] INPUT: mean={in_tensor.mean().item():.6f}, std={in_tensor.std().item():.6f}")
+                            print(f"    [DEBUG]   transformer_block[{idx}] OUTPUT: mean={output.mean().item():.6f}, std={output.std().item():.6f}")
+                        return block_hook
+                    # Hook the attention layer
+                    if 'attn' in block:
+                        hook_handles.append(block['attn'].register_forward_hook(make_block_hook(block_idx)))
+
     with torch.no_grad():
         # Encode text
         caption_embs, emb_masks = text_encoder.get_text_embeddings([prompt])
         y = caption_embs.float()[:, None].to(device)
+        emb_masks = emb_masks.to(device)
 
         # Encode references to latent space
         # ref_images: (N, 3, H, W)
@@ -178,13 +268,17 @@ def generate_with_references(
         # z_ref: (N, 4, h, w)
         z_ref = z_ref.unsqueeze(0)  # (1, N, 4, h, w)
 
+        if debug:
+            print(f"    [DEBUG] z_ref shape: {z_ref.shape}, mean: {z_ref.mean().item():.3f}, std: {z_ref.std().item():.3f}")
+
         # Sample
-        _, _, h, w = z_ref.shape[2:]
+        h, w = z_ref.shape[-2:]
         z_gen = diffusion.ddim_sample(
             model=model,
             shape=(1, 4, h, w),
             y=y,
             x_ref=z_ref,
+            mask=emb_masks,
             steps=steps,
             cfg_scale=cfg_scale,
             device=device,
@@ -193,9 +287,22 @@ def generate_with_references(
         # Decode
         img_gen = vae.decode(z_gen / scale_factor).sample[0]  # (3, H, W)
 
+        if debug:
+            print(f"    [DEBUG] z_gen shape: {z_gen.shape}, mean: {z_gen.mean().item():.3f}, std: {z_gen.std().item():.3f}")
+            print(f"    [DEBUG] img_gen shape: {img_gen.shape}, mean: {img_gen.mean().item():.3f}, std: {img_gen.std().item():.3f}")
+
         # Decode references
         z_ref_flat = z_ref.squeeze(0)  # (N, 4, h, w)
         img_refs = vae.decode(z_ref_flat / scale_factor).sample  # (N, 3, H, W)
+
+    # Remove all hooks
+    for hook_handle in hook_handles:
+        hook_handle.remove()
+
+    # Return captured ref_tokens for analysis if debug
+    if debug and 'output' in ref_tokens_captured:
+        ref_tokens = ref_tokens_captured['output']
+        print(f"    [DEBUG] Final ref_tokens check: shape={ref_tokens.shape}, mean={ref_tokens.mean().item():.3f}, std={ref_tokens.std().item():.3f}")
 
     return img_gen, img_refs
 
@@ -210,22 +317,30 @@ def main():
     parser.add_argument('--cfg_scale', type=float, default=4.5, help='CFG scale')
     parser.add_argument('--steps', type=int, default=20, help='Sampling steps')
     parser.add_argument('--num_refs', type=int, default=3, help='Number of reference images per set')
+    parser.add_argument('--num_samples', type=int, default=4, help='Number of samples per reference set')
+    parser.add_argument('--fixed_seed', action='store_true', help='Use fixed seed across all reference sets to test reference influence')
+    parser.add_argument('--debug', action='store_true', help='Print debug information (stats, shapes, etc.)')
     parser.add_argument('--device', type=str, default='cuda', help='Device')
 
     args = parser.parse_args()
 
-    # Create output directory
-    os.makedirs(args.output_dir, exist_ok=True)
+    # Create output directory based on prompt
+    import re
+    prompt_folder = re.sub(r'[^\w\s-]', '', args.prompt).strip().replace(' ', '_')[:50]
+    output_dir = os.path.join(args.output_dir, prompt_folder)
+    os.makedirs(output_dir, exist_ok=True)
 
     # ============================================
     # TODO: Fill in your reference image sets!
-    # Each set should contain image IDs or indices to use as references
+    # Each set specifies:
+    #   - image_idx: which image from dataset to use
+    #   - layer_indices: which layers from that image to use as references
     # ============================================
     reference_sets = [
-        # Example sets - REPLACE WITH YOUR ACTUAL IMAGE IDs
-        {'name': 'set1_zebras', 'indices': [0, 1, 2]},
-        {'name': 'set2_horses', 'indices': [10, 11, 12]},
-        {'name': 'set3_cats', 'indices': [20, 21, 22]},
+        # Example sets - REPLACE WITH YOUR ACTUAL VALUES
+        {'name': 'set1_image0', 'image_idx': 0, 'layer_indices': [0, 1, 2, 3]},
+        {'name': 'set2_image1', 'image_idx': 1, 'layer_indices': [0, 1, 2, 3]},
+        {'name': 'set3_image2', 'image_idx': 2, 'layer_indices': [0, 1, 2, 3]},
         # Add more sets here...
     ]
 
@@ -237,7 +352,8 @@ def main():
     print(f"Prompt: '{args.prompt}'")
     print(f"CFG scale: {args.cfg_scale}")
     print(f"Steps: {args.steps}")
-    print(f"Output dir: {args.output_dir}")
+    print(f"Num samples per set: {args.num_samples}")
+    print(f"Output dir: {output_dir}")
     print("="*60)
 
     device = torch.device(args.device)
@@ -275,58 +391,86 @@ def main():
 
     for set_idx, ref_set in enumerate(reference_sets):
         set_name = ref_set['name']
-        indices = ref_set['indices']
+        image_idx = ref_set['image_idx']
+        layer_indices = ref_set['layer_indices']
 
         print(f"\n[{set_idx+1}/{len(reference_sets)}] Generating with {set_name}...")
-        print(f"  Reference indices: {indices}")
+        print(f"  Image index: {image_idx}, Layer indices: {layer_indices}")
 
-        # Load reference images
-        # NOTE: You'll need to implement proper image loading based on indices
-        # For now, we use a placeholder that gets images from dataloader
+        # Load reference layers from the specified image
         ref_images, ref_captions = load_reference_images(
             dataloader,
-            indices,
-            args.num_refs,
+            image_idx,
+            layer_indices,
             device
         )
 
-        print(f"  Reference shape: {ref_images.shape}")
-        print(f"  Reference captions: {ref_captions[:2]}...")  # Print first 2
+        if args.debug:
+            print(f"  [DEBUG] Reference shape: {ref_images.shape}")
+            print(f"  [DEBUG] Reference image stats: mean={ref_images.mean().item():.3f}, std={ref_images.std().item():.3f}")
+            print(f"  Reference captions:")
+            for i, cap in enumerate(ref_captions):
+                print(f"    [Layer {layer_indices[i]}] {cap[:80]}...")  # Print first 80 chars of each caption
+        else:
+            print(f"  Loaded {len(ref_captions)} reference layers")
 
-        # Generate
-        img_gen, img_refs = generate_with_references(
-            model=model,
-            vae=vae,
-            text_encoder=text_encoder,
-            diffusion=diffusion,
-            prompt=args.prompt,
-            ref_images=ref_images,
-            device=device,
-            cfg_scale=args.cfg_scale,
-            steps=args.steps,
-            scale_factor=config.scale_factor
-        )
+        # Generate multiple samples with different seeds
+        all_samples = []
+        img_refs = None
 
-        # Save individual result: [ref1, ref2, ref3, generated]
-        images = [img_refs[i] for i in range(args.num_refs)] + [img_gen]
-        grid = make_grid(images, nrow=args.num_refs + 1, normalize=True, value_range=(-1, 1))
+        for sample_idx in range(args.num_samples):
+            print(f"  Generating sample {sample_idx + 1}/{args.num_samples}...")
 
-        save_path = os.path.join(args.output_dir, f'{set_name}.png')
+            # Set different seed for each sample and each reference set
+            if args.fixed_seed:
+                # Use same seed across all reference sets to test reference influence
+                seed = 42 + sample_idx
+            else:
+                # Use different seeds for each reference set
+                seed = 42 + set_idx * 1000 + sample_idx
+            torch.manual_seed(seed)
+
+            img_gen, img_refs_tmp = generate_with_references(
+                model=model,
+                vae=vae,
+                text_encoder=text_encoder,
+                diffusion=diffusion,
+                prompt=args.prompt,
+                ref_images=ref_images,
+                device=device,
+                cfg_scale=args.cfg_scale,
+                steps=args.steps,
+                scale_factor=config.scale_factor,
+                debug=args.debug
+            )
+
+            all_samples.append(img_gen)
+            if img_refs is None:
+                img_refs = img_refs_tmp
+
+        # Save result: [ref1, ref2, ref3, ..., sample1, sample2, sample3, sample4]
+        num_refs_loaded = img_refs.shape[0]
+        images = [img_refs[i] for i in range(num_refs_loaded)] + all_samples
+        grid = make_grid(images, nrow=num_refs_loaded + args.num_samples, normalize=True, value_range=(-1, 1))
+
+        save_path = os.path.join(output_dir, f'{set_name}.png')
         save_image(grid, save_path)
         print(f"  Saved to: {save_path}")
 
-        all_generated.append(img_gen)
+        all_generated.extend(all_samples)
 
     # Save comparison: all generated images together
     if len(all_generated) > 0:
-        comparison_grid = make_grid(all_generated, nrow=len(all_generated), normalize=True, value_range=(-1, 1))
-        comparison_path = os.path.join(args.output_dir, 'all_generated_comparison.png')
+        # Limit number of images per row for better visualization
+        nrow = min(args.num_samples, 8)
+        comparison_grid = make_grid(all_generated, nrow=nrow, normalize=True, value_range=(-1, 1))
+        comparison_path = os.path.join(output_dir, 'all_generated_comparison.png')
         save_image(comparison_grid, comparison_path)
         print(f"\n[Comparison] All generated images saved to: {comparison_path}")
 
     print("\n" + "="*60)
     print("Test completed!")
-    print(f"Results saved in: {args.output_dir}")
+    print(f"Results saved in: {output_dir}")
     print("="*60)
 
 

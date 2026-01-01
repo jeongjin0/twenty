@@ -32,8 +32,8 @@ learn_sigma = True
 # Training Settings
 # ============================================
 num_epochs = 100
-train_batch_size = 8  # per GPU
-gradient_accumulation_steps = 2  # effective batch = 4 * 4 * num_gpus
+train_batch_size = 4  # per GPU
+gradient_accumulation_steps = 4  # effective batch = 4 * 4 * num_gpus
 eval_interval = 1000
 # Diffusion
 train_sampling_steps = 1000
@@ -92,4 +92,4 @@ lewei_scale = 1.0
 # Optional: Layer-wise Augmentation
 # ============================================
 shuffle_ref = True
-merge_augmentation_prob = 0.0
+merge_augmentation_prob = 0.1

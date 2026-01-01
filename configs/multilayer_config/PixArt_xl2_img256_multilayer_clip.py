@@ -1,5 +1,5 @@
-# config/multilayer_pixart_512.py
-# MultiLayerPixArt Training Configuration
+# config/multilayer_pixart_256_clip.py
+# MultiLayerPixArt Training with CLIP Reference Encoder and Text Dropout
 
 _base_ = ['../PixArt_xl2_internal.py']
 
@@ -29,12 +29,32 @@ pred_sigma = True
 learn_sigma = True
 
 # ============================================
+# 🔥 NEW: CLIP Reference Encoder Settings
+# ============================================
+use_clip_ref_encoder = False  # Use custom reference encoder (train from scratch)
+clip_model_name = "openai/clip-vit-large-patch14"  # CLIP model name
+freeze_clip = True  # Freeze CLIP weights (only train projection layer)
+
+# ============================================
+# 🔥 NEW: Text Dropout Settings (Dynamic)
+# ============================================
+# Stage 1 (0~10000 steps): Moderate dropout to encourage reference usage
+text_dropout_prob_initial = 0.5  # 30% text dropout - balanced learning with ref
+
+# Stage 2 (10000+ steps): Lower dropout for optional guidance
+text_dropout_prob_final = 0.1    # 10% text dropout - ref as optional guidance
+
+# Transition point
+text_dropout_transition_step = 20000
+
+# ============================================
 # Training Settings
 # ============================================
 num_epochs = 100
-train_batch_size = 8  # per GPU
-gradient_accumulation_steps = 2  # effective batch = 4 * 4 * num_gpus
+train_batch_size = 4  # per GPU
+gradient_accumulation_steps = 4  # effective batch = 8 * 2 * num_gpus
 eval_interval = 1000
+
 # Diffusion
 train_sampling_steps = 1000
 snr_loss = False
@@ -59,13 +79,12 @@ lr_schedule_args = dict(
 ema_rate = 0.9999
 
 # Gradient clipping
-gradient_clip = 1.0
 gradient_clip = 0.5
 
 # ============================================
 # Logging & Saving
 # ============================================
-work_dir = './output/multilayer_pixart_512'
+work_dir = './output/multilayer_pixart_256_clip'
 log_interval = 50
 save_model_epochs = 5
 save_model_steps = 5000
@@ -74,22 +93,20 @@ save_model_steps = 5000
 # Distributed Training
 # ============================================
 use_fsdp = False
-#mixed_precision = 'fp16'  # or 'bf16' for A100
 mixed_precision = "fp16"
 multi_scale = False
 num_workers = 4
 
 # ============================================
-# Optional: Window Attention (from PixArt)
+# Optional: Window Attention
 # ============================================
 window_block_indexes = []
 window_size = 0
 use_rel_pos = False
 lewei_scale = 1.0
 
-
 # ============================================
-# Optional: Layer-wise Augmentation
+# Layer-wise Augmentation
 # ============================================
 shuffle_ref = True
 merge_augmentation_prob = 0.0

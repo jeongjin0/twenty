@@ -28,8 +28,8 @@ from diffusion.model.nets.PixArt_blocks import (
     TimestepEmbedder,
 )
 
-
 class PixArtBlock(nn.Module):
+    """A PixArt block with adaptive layer norm (adaLN-single) conditioning."""
     def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, drop_path=0., 
                  window_size=0, input_size=None, use_rel_pos=False, **block_kwargs):
         super().__init__()
@@ -103,6 +103,102 @@ def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
 #################################################################################
 #                    Reference Encoder (Token-based for Cross-Attention)        #
 #################################################################################
+
+class CLIPReferenceEncoder(nn.Module):
+    """
+    CLIP Vision Encoder를 사용한 Reference Encoder.
+    Pixel space RGB 이미지에서 semantic features 추출.
+
+    IMPORTANT: 이 encoder는 pixel space RGB 이미지를 입력으로 받음 (VAE latent 아님)
+    """
+    def __init__(
+        self,
+        hidden_size=1152,
+        max_layers=16,
+        clip_model_name="openai/clip-vit-large-patch14",
+        freeze_clip=True,
+    ):
+        super().__init__()
+        from transformers import CLIPVisionModel, CLIPImageProcessor
+
+        self.hidden_size = hidden_size
+        self.max_layers = max_layers
+
+        # Load pretrained CLIP vision encoder
+        self.clip_encoder = CLIPVisionModel.from_pretrained(clip_model_name)
+        clip_hidden_size = self.clip_encoder.config.hidden_size  # 1024 for large
+
+        # CLIP image processor for normalization
+        self.clip_processor = CLIPImageProcessor.from_pretrained(clip_model_name)
+
+        if freeze_clip:
+            for param in self.clip_encoder.parameters():
+                param.requires_grad = False
+
+        # Project CLIP features to model hidden size
+        self.proj = nn.Linear(clip_hidden_size, hidden_size)
+
+        # Layer embedding to distinguish different reference layers
+        self.layer_embed = nn.Parameter(torch.zeros(1, max_layers, 1, hidden_size))
+
+        # Reference type embedding
+        self.ref_type_embed = nn.Parameter(torch.zeros(1, 1, hidden_size))
+
+        self.initialize_weights()
+
+    def initialize_weights(self):
+        nn.init.normal_(self.layer_embed, std=0.02)
+        nn.init.normal_(self.ref_type_embed, std=0.02)
+
+    def forward(self, ref_images_rgb):
+        """
+        ref_images_rgb: (B, N_ref, 3, H, W) - reference RGB images in PIXEL SPACE [0, 1]
+        Returns: (B, N_ref * num_patches, D) - token sequence for cross-attention
+        """
+        B, N_ref, C, H, W = ref_images_rgb.shape
+        device = ref_images_rgb.device
+
+        assert C == 3, f"Expected 3-channel RGB, got {C} channels"
+
+        # Reshape for CLIP: (B*N_ref, 3, H, W)
+        ref_rgb_flat = ref_images_rgb.reshape(B * N_ref, 3, H, W)
+
+        # Resize to CLIP expected size (224x224)
+        ref_rgb_resized = F.interpolate(
+            ref_rgb_flat,
+            size=(224, 224),
+            mode='bilinear',
+            align_corners=False
+        )
+
+        # CLIP normalization: [0, 1] -> CLIP normalized
+        # CLIP expects mean=[0.48145466, 0.4578275, 0.40821073], std=[0.26862954, 0.26130258, 0.27577711]
+        mean = torch.tensor([0.48145466, 0.4578275, 0.40821073], device=device).view(1, 3, 1, 1)
+        std = torch.tensor([0.26862954, 0.26130258, 0.27577711], device=device).view(1, 3, 1, 1)
+        ref_rgb_normalized = (ref_rgb_resized - mean) / std
+
+        # Get CLIP features
+        clip_outputs = self.clip_encoder(pixel_values=ref_rgb_normalized)
+        clip_features = clip_outputs.last_hidden_state  # (B*N_ref, num_patches, clip_hidden_size)
+
+        # Project to model hidden size
+        features = self.proj(clip_features)  # (B*N_ref, num_patches, hidden_size)
+
+        # Reshape: (B, N_ref, num_patches, hidden_size)
+        num_patches = features.shape[1]
+        features = features.reshape(B, N_ref, num_patches, self.hidden_size)
+
+        # Add layer embeddings
+        features = features + self.layer_embed[:, :N_ref, :, :]
+
+        # Flatten: (B, N_ref * num_patches, hidden_size)
+        features = features.reshape(B, N_ref * num_patches, self.hidden_size)
+
+        # Add reference type embedding
+        features = features + self.ref_type_embed
+
+        return features
+
 
 class ReferenceTokenEncoder(nn.Module):
     """
@@ -265,6 +361,9 @@ class ReferencePixArtCrossAttn(nn.Module):
         max_ref_layers=15,
         ref_encoder_depth=4,
         ref_compression_ratio=4,
+        use_clip_ref_encoder=False,  # Use CLIP vision encoder
+        clip_model_name="openai/clip-vit-large-patch14",
+        freeze_clip=True,
         **kwargs
     ):
         super().__init__()
@@ -302,18 +401,30 @@ class ReferencePixArtCrossAttn(nn.Module):
             token_num=model_max_length
         )
 
-        # Reference Token Encoder (새로운!)
-        self.ref_encoder = ReferenceTokenEncoder(
-            input_size=input_size,
-            patch_size=patch_size,
-            in_channels=in_channels,
-            hidden_size=hidden_size,
-            num_heads=num_heads,
-            depth=ref_encoder_depth,
-            mlp_ratio=mlp_ratio,
-            max_layers=max_ref_layers,
-            compression_ratio=ref_compression_ratio,
-        )
+        # Reference Token Encoder
+        if use_clip_ref_encoder:
+            # Use pretrained CLIP vision encoder
+            self.ref_encoder = CLIPReferenceEncoder(
+                hidden_size=hidden_size,
+                max_layers=max_ref_layers,
+                clip_model_name=clip_model_name,
+                freeze_clip=freeze_clip,
+            )
+            print(f"[Model] Using CLIP Reference Encoder: {clip_model_name}")
+        else:
+            # Use custom reference token encoder
+            self.ref_encoder = ReferenceTokenEncoder(
+                input_size=input_size,
+                patch_size=patch_size,
+                in_channels=in_channels,
+                hidden_size=hidden_size,
+                num_heads=num_heads,
+                depth=ref_encoder_depth,
+                mlp_ratio=mlp_ratio,
+                max_layers=max_ref_layers,
+                compression_ratio=ref_compression_ratio,
+            )
+            print("[Model] Using Custom Reference Token Encoder")
 
         # Transformer blocks
         drop_path_rates = [x.item() for x in torch.linspace(0, drop_path, depth)]
@@ -419,14 +530,24 @@ class ReferencePixArtCrossAttn(nn.Module):
         # Shape: (B, L + N_ref*T_comp, D)
         cond_tokens = torch.cat([y, ref_tokens], dim=1)
 
+        # Extend mask to cover reference tokens (references are always valid)
+        if mask is not None:
+            # mask is (B, L) for text tokens
+            # Create mask for reference tokens (all ones since they're always valid)
+            ref_mask = torch.ones(B, ref_tokens.shape[1], device=mask.device, dtype=mask.dtype)
+            # Concatenate: (B, L + N_ref*T_comp)
+            extended_mask = torch.cat([mask, ref_mask], dim=1)
+        else:
+            extended_mask = None
+
         # 6. Transformer blocks with combined cross-attention
         if self.gradient_checkpointing and self.training:
             from torch.utils.checkpoint import checkpoint
             for block in self.blocks:
-                x = checkpoint(block, x, cond_tokens, t0, None, use_reentrant=False)
+                x = checkpoint(block, x, cond_tokens, t0, extended_mask, use_reentrant=False)
         else:
             for block in self.blocks:
-                x = block(x, cond_tokens, t0)
+                x = block(x, cond_tokens, t0, extended_mask)
 
         # 7. Final layer
         x = self.final_layer(x, t)

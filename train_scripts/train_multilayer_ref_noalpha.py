@@ -5,6 +5,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.environ['NCCL_P2P_DISABLE'] = '1'
 
+import gc
 import time
 import types
 import warnings
@@ -86,6 +87,48 @@ def reset_memory_stats():
     torch.cuda.empty_cache()
 
 
+def extract_reference_rgb_pixel(layers, num_layers, target_indices, shuffle_ref=True):
+    """
+    Pixel space에서 reference RGB 이미지 추출 (CLIP용)
+
+    Args:
+        layers: (B, N, C, H, W) input layers in pixel space [0, 1]
+        num_layers: (B,) actual number of layers per sample
+        target_indices: List[int] target layer index for each sample
+        shuffle_ref: If True, shuffle reference order
+
+    Returns:
+        ref_rgb: (B, N_ref, 3, H, W) reference RGB images in pixel space [0, 1]
+    """
+    B, N, C, H, W = layers.shape
+    device = layers.device
+
+    # RGB만 추출 (alpha 제외)
+    rgb = layers[:, :, :3, :, :]  # (B, N, 3, H, W)
+
+    # Batch별로 reference 분리
+    ref_rgb_list = []
+
+    for b in range(B):
+        t_idx = target_indices[b]
+
+        # Reference indices (exclude target)
+        ref_indices = [i for i in range(N) if i != t_idx]
+
+        # Shuffle reference order
+        if shuffle_ref:
+            import random
+            random.shuffle(ref_indices)
+
+        ref_rgb_b = rgb[b, ref_indices]  # (N-1, 3, H, W)
+        ref_rgb_list.append(ref_rgb_b)
+
+    # Stack into batch
+    ref_rgb = torch.stack(ref_rgb_list, dim=0)  # (B, N-1, 3, H, W)
+
+    return ref_rgb
+
+
 def encode_reference_vae_rgb_batch(vae, layers, num_layers, target_indices, scale_factor=0.18215,
                                    shuffle_ref=True, merge_augmentation_prob=0.0):
     """
@@ -133,42 +176,10 @@ def encode_reference_vae_rgb_batch(vae, layers, num_layers, target_indices, scal
             random.shuffle(ref_indices)
 
         z_ref_b = z_all[b, ref_indices]  # (N-1, 4, h, w)
-
-        # Merge augmentation: combine two random reference layers
-        if merge_augmentation_prob > 0 and len(ref_indices) >= 2:
-            if torch.rand(1).item() < merge_augmentation_prob:
-                # Pick two random indices to merge
-                merge_idx1 = torch.randint(0, len(ref_indices), (1,)).item()
-                merge_idx2 = torch.randint(0, len(ref_indices), (1,)).item()
-
-                # Make sure they're different
-                while merge_idx2 == merge_idx1:
-                    merge_idx2 = torch.randint(0, len(ref_indices), (1,)).item()
-
-                # Merge by averaging (or you could use other strategies)
-                merged = (z_ref_b[merge_idx1] + z_ref_b[merge_idx2]) / 2.0
-
-                # Remove the two layers and add merged one
-                keep_indices = [i for i in range(len(ref_indices)) if i not in [merge_idx1, merge_idx2]]
-                z_ref_merged = [z_ref_b[i] for i in keep_indices]
-                z_ref_merged.append(merged)
-
-                # Stack merged references
-                z_ref_b = torch.stack(z_ref_merged, dim=0)
-
-                # Add zero padding to maintain original size for batching
-                # Original size: len(ref_indices), Current size: len(z_ref_merged)
-                original_size = len(ref_indices)
-                current_size = z_ref_b.shape[0]
-                if current_size < original_size:
-                    pad_size = original_size - current_size
-                    pad = torch.zeros(pad_size, C_latent, h, w, device=device, dtype=z_ref_b.dtype)
-                    z_ref_b = torch.cat([z_ref_b, pad], dim=0)
-
         z_ref_list.append(z_ref_b)
 
     z_target = torch.stack(z_target_list, dim=0)  # (B, 4, h, w)
-    z_ref = torch.stack(z_ref_list, dim=0)  # (B, N-1 or less, 4, h, w)
+    z_ref = torch.stack(z_ref_list, dim=0)  # (B, N-1, 4, h, w)
 
     return z_target, z_ref
 
@@ -206,6 +217,7 @@ def run_evaluation(model, vae, multilayer_diffusion, dataloader, text_encoder,
         target_idx = torch.randint(0, actual_layers, (1,)).item() #target layer is 0 or 1
         target_indices = [min(target_idx, num_layers[b].item() - 1) for b in range(B)]
 
+        # VAE encoding for both target and references
         z_target, z_ref = encode_reference_vae_rgb_batch(
             vae, layers, num_layers,
             target_indices=target_indices,
@@ -216,28 +228,28 @@ def run_evaluation(model, vae, multilayer_diffusion, dataloader, text_encoder,
         # T5 encoding
         caption_embs, emb_masks = text_encoder.get_text_embeddings(target_captions)
         y = caption_embs.float()[:, None]
-    
+
 
     with torch.no_grad():
-          
+
         # Evaluate
         results = multilayer_diffusion.evaluate(
             model=accelerator.unwrap_model(model),
             vae=vae,
             z_target=z_target,
-            z_ref=z_ref,
+            z_ref=z_ref,  # VAE latent
             y=y,
             steps=20,
             cfg_scale=4.5,
             scale_factor=config.scale_factor,
         )
-    
+
     # Plot and save
     os.makedirs(save_dir, exist_ok=True)
-    
+
     for b in range(min(B, 4)):  # 최대 4개 샘플
         n_ref = z_ref.shape[1]
-        
+
         # Collect images: refs + target(GT) + generated
         images = []
         for r in range(n_ref):
@@ -321,19 +333,43 @@ def train():
                 shuffle_ref = getattr(config, 'shuffle_ref', True)
                 merge_augmentation_prob = getattr(config, 'merge_augmentation_prob', 0.0)
 
+                # VAE encoding for both target and references
                 z_target, z_ref = encode_reference_vae_rgb_batch(
                     vae, layers, num_layers,
                     target_indices=target_indices,
                     scale_factor=config.scale_factor,
                     shuffle_ref=shuffle_ref,
                     merge_augmentation_prob=merge_augmentation_prob
-                )                
+                )
+
+                # Memory optimization: clear cache after VAE encoding
+                torch.cuda.empty_cache()
 
             with torch.no_grad():
                 target_captions = [captions[b][target_indices[b]] for b in range(B)]
+
+                # Dynamic text dropout: High dropout initially to force reference usage
+                dropout_initial = getattr(config, 'text_dropout_prob_initial', 0.9)
+                dropout_final = getattr(config, 'text_dropout_prob_final', 0.1)
+                transition_step = getattr(config, 'text_dropout_transition_step', 10000)
+
+                # Calculate current dropout probability
+                if global_step < transition_step:
+                    text_dropout_prob = dropout_initial
+                else:
+                    text_dropout_prob = dropout_final
+
+                if text_dropout_prob > 0:
+                    import random
+                    target_captions = [
+                        "" if random.random() < text_dropout_prob else cap
+                        for cap in target_captions
+                    ]
+
                 caption_embs, emb_masks = text_encoder.get_text_embeddings(target_captions)
-                y = caption_embs.float()[:, None]
-                y_mask = emb_masks
+                # Move to GPU
+                y = caption_embs.float()[:, None].to(accelerator.device)
+                y_mask = emb_masks.to(accelerator.device)
 
             # 4. Sample timesteps
             timesteps = torch.randint(
@@ -352,7 +388,7 @@ def train():
                     model_kwargs=dict(
                         y=y,
                         mask=y_mask,
-                        x_ref=z_ref,  # (B, N-1, 4, h, w)
+                        x_ref=z_ref,  # (B, N-1, 4, h, w) - VAE latent
                     ),
                 )
                 
@@ -395,17 +431,18 @@ def train():
 
                 optimizer.step()
                 lr_scheduler.step()
-                
+
                 if accelerator.sync_gradients:
                     ema_update(model_ema, model, config.ema_rate)
 
-            if global_step == 10000:
-                logger.info(f"[Step {global_step}] Unfreezing all layers")
-                for param in model.parameters():
-                    param.requires_grad = True
-                
-                # optimizer = build_optimizer(accelerator.unwrap_model(model), config.optimizer)
-                # optimizer = accelerator.prepare(optimizer)
+            # Memory optimization: periodic cache cleanup every 10 steps
+            if (step + 1) % 10 == 0:
+                gc.collect()
+                torch.cuda.empty_cache()
+
+            # Log dropout transition
+            if global_step == transition_step:
+                logger.info(f"[Step {global_step}] Transitioning text dropout: {dropout_initial} -> {dropout_final}")
 
             # ============================================
             # 6. Logging
@@ -431,7 +468,7 @@ def train():
 
                 info = f"Step/Epoch [{(epoch-1)*len(train_dataloader)+step+1}/{epoch}][{step + 1}/{len(train_dataloader)}]: " \
                        f"total_eta: {eta}, epoch_eta: {eta_epoch}, time_all: {t:.3f}, time_data: {t_d:.3f}, " \
-                       f"lr: {lr:.3e}, latent: ({h}, {w}), layers: {N} (avg: {avg_layers:.1f}), "
+                       f"lr: {lr:.3e}, text_drop: {text_dropout_prob:.2f}, latent: ({h}, {w}), layers: {N} (avg: {avg_layers:.1f}), "
                 info += ', '.join([f"{k}: {v:.4f}" for k, v in log_buffer.output.items()])
                 logger.info(info)
                 
@@ -511,7 +548,7 @@ def parse_args():
     parser.add_argument('--local_rank', type=int, default=-1)
     parser.add_argument('--debug', action='store_true')
     parser.add_argument('--use_ref', default=True)
-    parser.add_argument("--model_type", default="adaln", type=str)
+    parser.add_argument('--model_type', default='crossattn')
 
     parser.add_argument(
         "--report_to",
@@ -666,15 +703,23 @@ if __name__ == '__main__':
         ).train()
     elif model_type == 'crossattn':
         from diffusion.model.nets.PixArt_reference_crossattn import ReferencePixArtCrossAttn_XL_2
+
+        use_clip_ref_encoder = getattr(config, 'use_clip_ref_encoder', False)
+        clip_model_name = getattr(config, 'clip_model_name', "openai/clip-vit-large-patch14")
+        freeze_clip = getattr(config, 'freeze_clip', True)
+
         model = ReferencePixArtCrossAttn_XL_2(
-            input_size=latent_size,\
+            input_size=latent_size,
             in_channels=4,
             max_ref_layers=max_layers - 1,
             ref_encoder_depth=4,
-            ref_compression_ratio=4, 
+            ref_compression_ratio=4,
             caption_channels=4096,
             model_max_length=config.model_max_length,
             pred_sigma=pred_sigma,
+            use_clip_ref_encoder=use_clip_ref_encoder,
+            clip_model_name=clip_model_name,
+            freeze_clip=freeze_clip,
         ).train()
 
 
@@ -847,7 +892,7 @@ if __name__ == '__main__':
     t5_pretrained = getattr(config, 't5_pretrained', 'google/flan-t5-xxl')
     logger.info(f"Loading T5 from: {t5_pretrained}")
 
-    text_encoder = T5Embedder(device=accelerator.device, local_cache=True, cache_dir=t5_pretrained, torch_dtype=torch.float16)
+    text_encoder = T5Embedder(device="cuda", local_cache=True, cache_dir=t5_pretrained, torch_dtype=torch.float16)
     print_gpu_memory("After t5 load")
 
     # ============================================
