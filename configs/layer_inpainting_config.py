@@ -16,11 +16,11 @@ data_roots = [
 caption_type = 'blip2'  # or 't5', 'blip2'
 
 # Training
-batch_size = 16
+batch_size = 4
 num_workers = 4
 num_epochs = 60
 gradient_clip = 1.0
-gradient_accumulation_steps = 1
+gradient_accumulation_steps = 4
 gradient_checkpointing = True
 
 # Optimizer
