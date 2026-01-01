@@ -29,6 +29,7 @@ gradient_checkpointing = True
 train_sampling_steps = 1000
 
 # Pretrained models
+pretrained_pixart_path = '/workspace/twenty/PixArt-alpha/PixArt-XL-2-256x256.pth'
 vae_pretrained = '/workspace/twenty/PixArt-alpha/sd-vae-ft-ema'
 text_encoder_name = '/workspace/twenty/PixArt-alpha'
 

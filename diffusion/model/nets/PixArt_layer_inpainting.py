@@ -98,6 +98,10 @@ class PixArtLayerInpainting(nn.Module):
         # 5. Pretrained PixArt diffusion
         noise_pred_4ch = self.pixart(x, timestep, y, mask=mask)
 
+        # Handle pred_sigma: output might be 8 channels (noise + variance)
+        if self.pred_sigma and noise_pred_4ch.shape[1] == 8:
+            noise_pred_4ch = noise_pred_4ch[:, :4]  # Take only noise prediction
+
         # 6. Project back to N*4 channels: (B, 4, h, w) → (B, N*4, h, w)
         noise_pred_flat = self.output_proj(noise_pred_4ch)
 

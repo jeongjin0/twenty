@@ -91,10 +91,11 @@ def train():
     logger.info("Building model...")
 
     # Load pretrained PixArt
-    if args.pretrained_pixart:
-        logger.info(f"Loading pretrained PixArt from: {args.pretrained_pixart}")
+    pretrained_path = args.pretrained_pixart or getattr(config, 'pretrained_pixart_path', None)
+    if pretrained_path:
+        logger.info(f"Loading pretrained PixArt from: {pretrained_path}")
         pretrained_pixart = load_pretrained_pixart(
-            args.pretrained_pixart,
+            pretrained_path,
             input_size=config.image_size // 8
         )
     else:
