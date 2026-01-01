@@ -575,14 +575,16 @@ if __name__ == '__main__':
     for k, v in vars(args).items():
         print(f"{k}: {v}")
 
+
+    if args.use_ref == 'False' or args.use_ref == 'false':
+        args.use_ref = False
+
     if args.use_ref:
         print("✓ Running with reference images!")
     else:
         print("⚠ Running without reference images!")
 
 
-    if args.use_ref == 'False' or args.use_ref == 'false':
-        args.use_ref = False
         
     if args.work_dir is not None:
         config.work_dir = args.work_dir
@@ -612,7 +614,8 @@ if __name__ == '__main__':
     
     ddp_kwargs = DistributedDataParallelKwargs(
         broadcast_buffers=False,
-        gradient_as_bucket_view=False  # 명시적으로 False
+        gradient_as_bucket_view=False,  # 명시적으로 False
+        find_unused_parameters=True
     )
 
     if config.use_fsdp:
