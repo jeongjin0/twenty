@@ -2,6 +2,7 @@
 
 # Layer-wise Inpainting Inference Script (Using Dataset)
 # This script loads a sample from the dataset and generates a masked layer
+# File format: {image_id}-layer_{n}.png
 
 # ============================================
 # Configuration
@@ -11,11 +12,14 @@ VAE_PATH="/workspace/twenty/PixArt-alpha/sd-vae-ft-ema"
 T5_PATH="/workspace/twenty/PixArt-alpha"
 
 # Dataset configuration
-DATA_ROOT="../data/mulan_coco"  # or mulan_laion
-SAMPLE_ID="000000000139"  # Example image ID from COCO
+DATA_DIR="/workspace/twenty/data/mulan_coco"  # or data/mulan_laion
+IMAGE_ID="000000581346"  # Example image ID
 
 # Which layer to mask and regenerate (0-5 for max_layers=6)
 MASKED_IDX=1
+
+# Text prompt (you can customize this or read from metadata)
+PROMPT="a layer image"
 
 # Inference parameters
 CFG_SCALE=4.5
@@ -24,51 +28,59 @@ MAX_LAYERS=6
 IMAGE_SIZE=256
 
 # Output
-OUTPUT_DIR="output/layer_inpainting_v1/inference/${SAMPLE_ID}"
+OUTPUT_DIR="output/layer_inpainting_v1/inference/${IMAGE_ID}"
 mkdir -p ${OUTPUT_DIR}
 
 # ============================================
 # Extract visible layers from dataset
 # ============================================
-echo "Extracting layers from dataset sample: ${SAMPLE_ID}"
+echo "============================================"
+echo "Layer-wise Inpainting from Dataset"
+echo "============================================"
+echo "Image ID: ${IMAGE_ID}"
+echo "Data directory: ${DATA_DIR}"
+echo ""
 
-# Find the sample directory
-SAMPLE_DIR="${DATA_ROOT}/images/${SAMPLE_ID}"
+# Find all layer files for this image ID
+# Format: {image_id}-layer_{n}.png
+LAYER_FILES=($(ls ${DATA_DIR}/${IMAGE_ID}-layer_*.png 2>/dev/null | sort))
+NUM_LAYERS=${#LAYER_FILES[@]}
 
-if [ ! -d "${SAMPLE_DIR}" ]; then
-    echo "Error: Sample directory not found: ${SAMPLE_DIR}"
+if [ ${NUM_LAYERS} -eq 0 ]; then
+    echo "Error: No layer files found for image ID ${IMAGE_ID}"
+    echo "Looking for: ${DATA_DIR}/${IMAGE_ID}-layer_*.png"
     exit 1
 fi
 
-# Get all layer images (exclude the masked one)
-LAYER_IMAGES=($(find ${SAMPLE_DIR} -name "layer_*.png" | sort))
-NUM_LAYERS=${#LAYER_IMAGES[@]}
-
-echo "Found ${NUM_LAYERS} layers in sample ${SAMPLE_ID}"
+echo "Found ${NUM_LAYERS} layers:"
+for f in "${LAYER_FILES[@]}"; do
+    echo "  - $(basename $f)"
+done
+echo ""
 
 # Build visible layers list (exclude masked layer)
 VISIBLE_LAYERS=""
 MASKED_LAYER=""
-for i in "${!LAYER_IMAGES[@]}"; do
+
+for i in "${!LAYER_FILES[@]}"; do
     if [ $i -eq ${MASKED_IDX} ]; then
-        MASKED_LAYER="${LAYER_IMAGES[$i]}"
-        echo "  Layer $i: [MASKED] ${LAYER_IMAGES[$i]}"
+        MASKED_LAYER="${LAYER_FILES[$i]}"
+        echo "Layer $i: [MASKED] $(basename ${MASKED_LAYER})"
     else
-        VISIBLE_LAYERS="${VISIBLE_LAYERS} ${LAYER_IMAGES[$i]}"
-        echo "  Layer $i: [VISIBLE] ${LAYER_IMAGES[$i]}"
+        VISIBLE_LAYERS="${VISIBLE_LAYERS} ${LAYER_FILES[$i]}"
+        echo "Layer $i: [VISIBLE] $(basename ${LAYER_FILES[$i]})"
     fi
 done
 
-# Get the caption for the masked layer
-CAPTION_FILE="${SAMPLE_DIR}/captions.json"
-if [ -f "${CAPTION_FILE}" ]; then
-    # Extract caption for masked layer (assuming layer captions are in JSON)
-    PROMPT=$(python -c "import json; data=json.load(open('${CAPTION_FILE}')); print(data[${MASKED_IDX}])" 2>/dev/null || echo "a layer")
-    echo "Prompt for layer ${MASKED_IDX}: ${PROMPT}"
-else
-    PROMPT="a layer"
-    echo "Warning: No caption file found, using default prompt"
+if [ -z "${MASKED_LAYER}" ]; then
+    echo "Error: Masked layer index ${MASKED_IDX} not found (only ${NUM_LAYERS} layers available)"
+    exit 1
 fi
+
+echo ""
+echo "Prompt: ${PROMPT}"
+echo "============================================"
+echo ""
 
 # ============================================
 # Run Inference
@@ -98,11 +110,17 @@ echo "Creating comparison with ground truth..."
 
 # Copy ground truth for comparison
 if [ -f "${MASKED_LAYER}" ]; then
-    cp "${MASKED_LAYER}" "${OUTPUT_DIR}/ground_truth_layer_${MASKED_IDX}.png"
-    echo "Ground truth saved to: ${OUTPUT_DIR}/ground_truth_layer_${MASKED_IDX}.png"
+    GT_FILE="${OUTPUT_DIR}/ground_truth_layer_${MASKED_IDX}.png"
+    cp "${MASKED_LAYER}" "${GT_FILE}"
+    echo "  ✓ Ground truth: ${GT_FILE}"
 fi
 
 echo ""
+echo "============================================"
 echo "Inference complete!"
-echo "Generated layer: ${OUTPUT_FILE}"
-echo "All results in: ${OUTPUT_DIR}"
+echo "============================================"
+echo "Results saved to: ${OUTPUT_DIR}"
+echo "  - Generated: generated_layer_${MASKED_IDX}.png"
+echo "  - All layers: generated_layer_${MASKED_IDX}_all_layers.png"
+echo "  - Ground truth: ground_truth_layer_${MASKED_IDX}.png"
+echo "============================================"
