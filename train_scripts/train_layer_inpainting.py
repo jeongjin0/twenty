@@ -206,9 +206,12 @@ def train():
             # Encode to VAE latent with padding
             # ========================================
             with torch.no_grad():
-                # layers: (B, N, 3, H, W)
+                # layers: (B, N, 4, H, W) - RGBA
+                # Extract RGB only (first 3 channels)
+                layers_rgb = layers[:, :, :3, :, :]  # (B, N, 3, H, W)
+
                 # Flatten: (B, N, 3, H, W) → (B*N, 3, H, W)
-                layers_flat = layers.reshape(B * N, 3, H, W)
+                layers_flat = layers_rgb.reshape(B * N, 3, H, W)
 
                 # VAE encode
                 z_flat = vae.encode(layers_flat).latent_dist.mode() * 0.18215
