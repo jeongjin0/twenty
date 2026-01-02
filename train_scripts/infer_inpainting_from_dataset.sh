@@ -12,11 +12,11 @@ VAE_PATH="/workspace/twenty/PixArt-alpha/sd-vae-ft-ema"
 T5_PATH="/workspace/twenty/PixArt-alpha"
 
 # Dataset configuration
-DATA_DIR="/workspace/twenty/data/mulan_coco"  # or data/mulan_laion
+DATA_DIR="/workspace/data/mulan_coco"  # or data/mulan_laion
 IMAGE_ID="000000581346"  # Example image ID
 
 # Which layer to mask and regenerate (0-5 for max_layers=6)
-MASKED_IDX=1
+MASKED_IDX=2
 
 # Text prompt (you can customize this or read from metadata)
 PROMPT="a layer image"

@@ -16,7 +16,7 @@ T5_PATH="/workspace/twenty/PixArt-alpha"
 # VISIBLE_LAYER_2="/path/to/your/layer2.png"
 
 # Example: Using dataset images (mulan_coco format: {image_id}-layer_{n}.png)
-DATA_DIR="/workspace/twenty/data/mulan_coco"
+DATA_DIR="/workspace/data/mulan_coco"
 IMAGE_ID="000000581346"
 
 # Build layer paths from dataset
@@ -26,7 +26,7 @@ LAYER_2="${DATA_DIR}/${IMAGE_ID}-layer_2.png"
 
 # Use layers 0 and 2 as visible, regenerate layer 1
 VISIBLE_LAYERS="${LAYER_0} ${LAYER_2}"
-MASKED_IDX=1
+MASKED_IDX=3
 
 # Text prompt for the layer to generate
 PROMPT="a red apple on a white table"
