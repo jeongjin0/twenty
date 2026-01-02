@@ -36,19 +36,20 @@ class PixArtLayerInpainting(nn.Module):
         # Input: max_layers * 4 (latents) + max_layers (mask)
         input_channels = max_layers * 4 + max_layers  # 6*4 + 6 = 30
 
-        # Input projection: 30 → 4 channels
-        self.input_proj = nn.Conv2d(input_channels, 4, kernel_size=1)
-        # Initialize to average layers (identity-like for better signal preservation)
-        # Each output channel averages the corresponding channels from all layers
-        with torch.no_grad():
-            nn.init.zeros_(self.input_proj.weight)
-            nn.init.zeros_(self.input_proj.bias)
-            # For each output channel (0-3), average the same channel from all layers
-            for out_c in range(4):
-                for layer_idx in range(max_layers):
-                    in_c = layer_idx * 4 + out_c
-                    self.input_proj.weight[out_c, in_c, 0, 0] = 1.0 / max_layers
-            # Mask channels (last max_layers channels) are ignored for now
+        # Multi-layer Input Projection: 30 → 4 channels
+        # Uses spatial context (3×3 conv) and non-linearity for better layer blending
+        self.input_proj = nn.Sequential(
+            # Layer 1: Expand to intermediate channels
+            nn.Conv2d(input_channels, 64, kernel_size=3, padding=1),
+            nn.GroupNorm(8, 64),
+            nn.SiLU(),
+            # Layer 2: Process with non-linearity
+            nn.Conv2d(64, 32, kernel_size=3, padding=1),
+            nn.GroupNorm(8, 32),
+            nn.SiLU(),
+            # Layer 3: Project to 4 channels
+            nn.Conv2d(32, 4, kernel_size=1),
+        )
 
         # Pretrained PixArt backbone
         if pretrained_pixart is not None:
@@ -64,19 +65,21 @@ class PixArtLayerInpainting(nn.Module):
                 pred_sigma=pred_sigma,
             )
 
-        # Output projection: 4 → max_layers * 4
+        # Multi-layer Output Projection: 4 → max_layers * 4
+        # Uses spatial context and non-linearity for better layer reconstruction
         output_channels = max_layers * 4
-        self.output_proj = nn.Conv2d(4, output_channels, kernel_size=1)
-        # Initialize to broadcast (identity-like for better gradient flow)
-        # Each input channel is copied to the corresponding channel in all layers
-        with torch.no_grad():
-            nn.init.zeros_(self.output_proj.weight)
-            nn.init.zeros_(self.output_proj.bias)
-            # For each input channel (0-3), copy to all layers
-            for in_c in range(4):
-                for layer_idx in range(max_layers):
-                    out_c = layer_idx * 4 + in_c
-                    self.output_proj.weight[out_c, in_c, 0, 0] = 1.0
+        self.output_proj = nn.Sequential(
+            # Layer 1: Expand from 4 channels
+            nn.Conv2d(4, 32, kernel_size=3, padding=1),
+            nn.GroupNorm(8, 32),
+            nn.SiLU(),
+            # Layer 2: Process with non-linearity
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.GroupNorm(8, 64),
+            nn.SiLU(),
+            # Layer 3: Project to output channels
+            nn.Conv2d(64, output_channels, kernel_size=1),
+        )
 
         # Store pred_sigma flag
         self.pred_sigma = pred_sigma
