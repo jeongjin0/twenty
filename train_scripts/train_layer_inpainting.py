@@ -185,6 +185,15 @@ def train():
     logger.info("EMA model created")
 
     # ============================================
+    # 2-Stage Training: Initial freeze (before DDP)
+    # ============================================
+    pixart_freeze_epochs = getattr(config, 'pixart_freeze_epochs', 0)
+    if pixart_freeze_epochs > 0:
+        # Freeze PixArt for Stage 1 (must be done BEFORE accelerator.prepare)
+        model.pixart.requires_grad_(False)
+        logger.info(f"2-Stage Training: PixArt frozen for first {pixart_freeze_epochs} epochs")
+
+    # ============================================
     # Prepare with Accelerator
     # ============================================
     model, model_ema = accelerator.prepare(model, model_ema)
@@ -236,23 +245,17 @@ def train():
 
     for epoch in range(start_epoch, config.num_epochs):
         # ============================================
-        # 2-Stage Training: Freeze/Unfreeze PixArt
+        # 2-Stage Training: Unfreeze at Stage 2
         # ============================================
-        if pixart_freeze_epochs > 0:
-            if epoch < pixart_freeze_epochs:
-                # Stage 1: Freeze PixArt, train projections only
-                if epoch == start_epoch or epoch == 0:
-                    accelerator.unwrap_model(model).pixart.requires_grad_(False)
-                    logger.info(f"[Epoch {epoch}] Stage 1: PixArt frozen, training projections only")
-            elif epoch == pixart_freeze_epochs:
-                # Stage 2: Unfreeze PixArt
-                accelerator.unwrap_model(model).pixart.requires_grad_(True)
-                logger.info(f"[Epoch {epoch}] Stage 2: PixArt unfrozen, training full model")
-                # Optionally reduce learning rate when unfreezing
-                if hasattr(config, 'pixart_unfreeze_lr_scale'):
-                    for param_group in optimizer.param_groups:
-                        param_group['lr'] *= config.pixart_unfreeze_lr_scale
-                    logger.info(f"  Scaled learning rate by {config.pixart_unfreeze_lr_scale}")
+        if pixart_freeze_epochs > 0 and epoch == pixart_freeze_epochs:
+            # Stage 2: Unfreeze PixArt
+            accelerator.unwrap_model(model).pixart.requires_grad_(True)
+            logger.info(f"[Epoch {epoch}] Stage 2: PixArt unfrozen, training full model")
+            # Optionally reduce learning rate when unfreezing
+            if hasattr(config, 'pixart_unfreeze_lr_scale'):
+                for param_group in optimizer.param_groups:
+                    param_group['lr'] *= config.pixart_unfreeze_lr_scale
+                logger.info(f"  Scaled learning rate by {config.pixart_unfreeze_lr_scale}")
 
         model.train()
         data_time_all = 0
