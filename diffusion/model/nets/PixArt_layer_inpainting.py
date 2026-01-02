@@ -38,9 +38,17 @@ class PixArtLayerInpainting(nn.Module):
 
         # Input projection: 30 → 4 channels
         self.input_proj = nn.Conv2d(input_channels, 4, kernel_size=1)
-        # Initialize to zeros for stable training
-        nn.init.zeros_(self.input_proj.weight)
-        nn.init.zeros_(self.input_proj.bias)
+        # Initialize to average layers (identity-like for better signal preservation)
+        # Each output channel averages the corresponding channels from all layers
+        with torch.no_grad():
+            nn.init.zeros_(self.input_proj.weight)
+            nn.init.zeros_(self.input_proj.bias)
+            # For each output channel (0-3), average the same channel from all layers
+            for out_c in range(4):
+                for layer_idx in range(max_layers):
+                    in_c = layer_idx * 4 + out_c
+                    self.input_proj.weight[out_c, in_c, 0, 0] = 1.0 / max_layers
+            # Mask channels (last max_layers channels) are ignored for now
 
         # Pretrained PixArt backbone
         if pretrained_pixart is not None:
@@ -59,9 +67,16 @@ class PixArtLayerInpainting(nn.Module):
         # Output projection: 4 → max_layers * 4
         output_channels = max_layers * 4
         self.output_proj = nn.Conv2d(4, output_channels, kernel_size=1)
-        # Initialize to zeros for stable training
-        nn.init.zeros_(self.output_proj.weight)
-        nn.init.zeros_(self.output_proj.bias)
+        # Initialize to broadcast (identity-like for better gradient flow)
+        # Each input channel is copied to the corresponding channel in all layers
+        with torch.no_grad():
+            nn.init.zeros_(self.output_proj.weight)
+            nn.init.zeros_(self.output_proj.bias)
+            # For each input channel (0-3), copy to all layers
+            for in_c in range(4):
+                for layer_idx in range(max_layers):
+                    out_c = layer_idx * 4 + in_c
+                    self.output_proj.weight[out_c, in_c, 0, 0] = 1.0
 
         # Store pred_sigma flag
         self.pred_sigma = pred_sigma
