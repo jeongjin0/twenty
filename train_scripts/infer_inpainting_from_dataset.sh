@@ -43,7 +43,8 @@ echo ""
 
 # Find all layer files for this image ID
 # Format: {image_id}-layer_{n}.png
-LAYER_FILES=($(ls ${DATA_DIR}/${IMAGE_ID}-layer_*.png 2>/dev/null | sort))
+# Use version sort (-V) for proper numeric ordering (layer_0, layer_1, ..., layer_10)
+LAYER_FILES=($(ls ${DATA_DIR}/${IMAGE_ID}-layer_*.png 2>/dev/null | sort -V))
 NUM_LAYERS=${#LAYER_FILES[@]}
 
 if [ ${NUM_LAYERS} -eq 0 ]; then

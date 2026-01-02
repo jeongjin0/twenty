@@ -178,6 +178,12 @@ def inpaint_layer(
     x_t = clean_layers.clone()
     x_t[0, masked_idx] = torch.randn(4, h, w, device=device)
 
+    print(f"\nInitialization:")
+    print(f"  clean_layers stats: mean={clean_layers.mean().item():.4f}, std={clean_layers.std().item():.4f}")
+    print(f"  x_t stats: mean={x_t.mean().item():.4f}, std={x_t.std().item():.4f}")
+    print(f"  masked_idx: {masked_idx}, layer_mask: {layer_mask}")
+    print(f"  num_visible: {num_visible}, max_layers: {max_layers}")
+
     # DDIM sampling loop
     for i in tqdm(range(steps), desc="Inpainting"):
         t = timesteps[i].item()
@@ -196,9 +202,21 @@ def inpaint_layer(
             clean_layers=clean_layers
         )
 
+        # Debug: print stats every 10 steps
+        if i % 10 == 0 or i == steps - 1:
+            print(f"  Step {i}/{steps}: x_t mean={x_t.mean().item():.4f}, std={x_t.std().item():.4f}, "
+                  f"min={x_t.min().item():.4f}, max={x_t.max().item():.4f}")
+
     # Decode generated layer
+    print(f"\nDecoding:")
+    print(f"  Final x_t[masked={masked_idx}] stats: mean={x_t[0, masked_idx].mean().item():.4f}, std={x_t[0, masked_idx].std().item():.4f}")
+
     z_generated = x_t[0, masked_idx:masked_idx+1] / 0.18215
+    print(f"  z_generated stats: mean={z_generated.mean().item():.4f}, std={z_generated.std().item():.4f}")
+
     img_generated = vae.decode(z_generated).sample[0]
+    print(f"  img_generated stats: mean={img_generated.mean().item():.4f}, std={img_generated.std().item():.4f}, "
+          f"min={img_generated.min().item():.4f}, max={img_generated.max().item():.4f}")
 
     # Decode all layers for visualization
     all_imgs = []
@@ -206,6 +224,7 @@ def inpaint_layer(
         z = x_t[0, i:i+1] / 0.18215
         img = vae.decode(z).sample[0]
         all_imgs.append(img)
+        print(f"  Layer {i}: img mean={img.mean().item():.4f}, std={img.std().item():.4f}")
 
     all_imgs = torch.stack(all_imgs, dim=0)
 
