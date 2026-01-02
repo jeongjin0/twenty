@@ -23,6 +23,12 @@ gradient_clip = 1.0
 gradient_accumulation_steps = 4
 gradient_checkpointing = True
 
+# 2-Stage Training: Freeze PixArt for first N epochs
+# Stage 1: Train projections only (pretrained PixArt frozen)
+# Stage 2: Train full model (PixArt unfrozen)
+pixart_freeze_epochs = 5  # Freeze PixArt for first 5 epochs
+pixart_unfreeze_lr_scale = 0.5  # Reduce LR by 50% when unfreezing (optional)
+
 # Optimizer
 optimizer = dict(
     type='AdamW',
