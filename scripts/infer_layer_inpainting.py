@@ -72,7 +72,9 @@ def ddim_sample_step(
 
     # Text mask
     if y_mask is not None:
-        null_mask = torch.zeros(B, y_mask.shape[1], device=y_mask.device, dtype=y_mask.dtype)
+        # For unconditional, attend to null embedding (all ones)
+        # Using zeros causes division by zero in attention normalization
+        null_mask = torch.ones(B, y_mask.shape[1], device=y_mask.device, dtype=y_mask.dtype)
         text_mask_in = torch.cat([y_mask, null_mask], dim=0)
     else:
         text_mask_in = None
