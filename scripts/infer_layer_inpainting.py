@@ -325,6 +325,25 @@ def main():
     model.load_state_dict(state_dict, strict=False)
     print(f"  ✓ Model loaded from {args.checkpoint}")
 
+    # Check y_embedder.y_embedding for NaN
+    print(f"\n  [CRITICAL CHECK] y_embedder.y_embedding:")
+    if hasattr(model, 'y_embedder') or hasattr(model.pixart, 'y_embedder'):
+        y_emb = model.y_embedder.y_embedding if hasattr(model, 'y_embedder') else model.pixart.y_embedder.y_embedding
+        print(f"    Shape: {y_emb.shape}")
+        print(f"    Mean: {y_emb.mean().item():.6f}")
+        print(f"    Std: {y_emb.std().item():.6f}")
+        print(f"    Has NaN: {torch.isnan(y_emb).any().item()}")
+        print(f"    Has Inf: {torch.isinf(y_emb).any().item()}")
+
+        if torch.isnan(y_emb).any():
+            print(f"    ⚠️ WARNING: y_embedding contains NaN! This will cause inference to fail.")
+            print(f"    Initializing y_embedding to zeros as fallback...")
+            with torch.no_grad():
+                y_emb.zero_()
+            print(f"    ✓ y_embedding reset to zeros")
+    else:
+        print(f"    ⚠️ WARNING: y_embedder not found!")
+
     # Load VAE
     vae = AutoencoderKL.from_pretrained(args.vae_path).to(device).eval()
     print(f"  ✓ VAE loaded")
