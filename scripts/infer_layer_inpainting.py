@@ -58,6 +58,13 @@ def ddim_sample_step(
     t_in = torch.cat([t_batch, t_batch], dim=0)
     mask_in = torch.cat([layer_mask, layer_mask], dim=0)
 
+    # Debug input stats
+    if t == 999:  # First step
+        print(f"\n  [DEBUG] First step inputs:")
+        print(f"    x_in: mean={x_in.mean().item():.4f}, has_nan={torch.isnan(x_in).any().item()}")
+        print(f"    t_in: {t_in}")
+        print(f"    mask_in: {mask_in[0]}")
+
     # Get null text embedding
     null_y = model.y_embedder.y_embedding.unsqueeze(0).unsqueeze(0).expand(B, 1, -1, -1)
     null_y = null_y.to(y.device).to(y.dtype)
@@ -73,17 +80,35 @@ def ddim_sample_step(
     # Predict noise
     noise_pred = model(x_in, mask_in, t_in, y_in, mask=text_mask_in)
 
+    # Debug model output
+    if t == 999:  # First step
+        print(f"    noise_pred: mean={noise_pred.mean().item():.4f}, std={noise_pred.std().item():.4f}, has_nan={torch.isnan(noise_pred).any().item()}")
+
     # CFG
     noise_pred_cond, noise_pred_uncond = noise_pred.chunk(2, dim=0)
+
+    if t == 999:  # First step
+        print(f"    noise_pred_cond: mean={noise_pred_cond.mean().item():.4f}, has_nan={torch.isnan(noise_pred_cond).any().item()}")
+        print(f"    noise_pred_uncond: mean={noise_pred_uncond.mean().item():.4f}, has_nan={torch.isnan(noise_pred_uncond).any().item()}")
+
     noise_pred = noise_pred_uncond + cfg_scale * (noise_pred_cond - noise_pred_uncond)
+
+    if t == 999:  # First step
+        print(f"    noise_pred (after CFG): mean={noise_pred.mean().item():.4f}, has_nan={torch.isnan(noise_pred).any().item()}")
 
     # Get alpha values
     alpha_t = alphas_cumprod[t]
     alpha_next = alphas_cumprod[t_next] if t_next >= 0 else torch.tensor(1.0, device=x_t.device)
 
+    if t == 999:  # First step
+        print(f"    alpha_t: {alpha_t.item():.6f}, alpha_next: {alpha_next.item():.6f}")
+
     # DDIM update
     # Predict x0
     x0_pred = (x_t - torch.sqrt(1 - alpha_t) * noise_pred) / torch.sqrt(alpha_t)
+
+    if t == 999:  # First step
+        print(f"    x0_pred: mean={x0_pred.mean().item():.4f}, has_nan={torch.isnan(x0_pred).any().item()}")
 
     # Direction pointing to x_t
     dir_xt = torch.sqrt(1 - alpha_next) * noise_pred
@@ -91,9 +116,15 @@ def ddim_sample_step(
     # Next sample
     x_next = torch.sqrt(alpha_next) * x0_pred + dir_xt
 
+    if t == 999:  # First step
+        print(f"    x_next (before masking): mean={x_next.mean().item():.4f}, has_nan={torch.isnan(x_next).any().item()}")
+
     # Keep visible layers clean (only update masked layer)
     layer_mask_expanded = layer_mask.view(B, -1, 1, 1, 1)
     x_next = x_next * layer_mask_expanded + clean_layers * (1 - layer_mask_expanded)
+
+    if t == 999:  # First step
+        print(f"    x_next (after masking): mean={x_next.mean().item():.4f}, has_nan={torch.isnan(x_next).any().item()}\n")
 
     return x_next
 
