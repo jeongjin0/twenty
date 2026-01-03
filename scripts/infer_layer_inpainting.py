@@ -93,10 +93,18 @@ def ddim_sample_step(
         print(f"    noise_pred_cond: mean={noise_pred_cond.mean().item():.4f}, has_nan={torch.isnan(noise_pred_cond).any().item()}")
         print(f"    noise_pred_uncond: mean={noise_pred_uncond.mean().item():.4f}, has_nan={torch.isnan(noise_pred_uncond).any().item()}")
 
-    noise_pred = noise_pred_uncond + cfg_scale * (noise_pred_cond - noise_pred_uncond)
+    # CRITICAL FIX: Model was never trained with unconditional (null text)!
+    # Using unconditional prediction causes garbage outputs → colorful noise
+    # Solution: Use only conditional prediction (disable CFG)
+    if cfg_scale == 1.0:
+        # No CFG
+        noise_pred = noise_pred_cond
+    else:
+        # WARNING: This will likely produce garbage because model never saw null_y during training
+        noise_pred = noise_pred_uncond + cfg_scale * (noise_pred_cond - noise_pred_uncond)
 
     if t == 999:  # First step
-        print(f"    noise_pred (after CFG): mean={noise_pred.mean().item():.4f}, has_nan={torch.isnan(noise_pred).any().item()}")
+        print(f"    noise_pred (final): mean={noise_pred.mean().item():.4f}, has_nan={torch.isnan(noise_pred).any().item()}")
 
     # Get alpha values
     alpha_t = alphas_cumprod[t]
