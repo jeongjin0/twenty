@@ -117,52 +117,50 @@ def ddim_sample_step(
     # Model predicts noise for all 6 layers, but only masked layer's prediction is trained
     # Using untrained predictions for visible layers causes numerical instability
 
-    # Initialize x_next with current x_t (visible layers will stay unchanged)
+    # Initialize two versions:
+    # 1. x_next: Ground truth visible + Generated masked (final output)
+    # 2. x_next_model_all: Model predictions for ALL layers (for analysis)
     x_next = x_t.clone()
+    x_next_model_all = x_t.clone()
 
-    # Apply DDIM ONLY to masked layer
+    # Apply DDIM to ALL layers (for visualization)
     for b in range(B):
         for layer_idx in range(x_t.shape[1]):
-            if layer_mask[b, layer_idx] == 1:  # This is the masked layer
-                # Extract masked layer's latent and noise prediction
-                x_t_masked = x_t[b, layer_idx]
-                noise_pred_masked = noise_pred[b, layer_idx]
+            x_t_layer = x_t[b, layer_idx]
+            noise_pred_layer = noise_pred[b, layer_idx]
 
-                if t == 999:  # First step - detailed debug
+            # DDIM formula
+            x0_pred_layer = (x_t_layer - torch.sqrt(1 - alpha_t) * noise_pred_layer) / torch.sqrt(alpha_t)
+
+            # Clip for stability
+            x0_pred_layer = torch.clamp(x0_pred_layer, min=-3.0, max=3.0)
+
+            dir_xt_layer = torch.sqrt(1 - alpha_next) * noise_pred_layer
+            x_next_layer = torch.sqrt(alpha_next) * x0_pred_layer + dir_xt_layer
+
+            # Update model_all version for ALL layers
+            x_next_model_all[b, layer_idx] = x_next_layer
+
+            # Update final version ONLY for masked layer
+            if layer_mask[b, layer_idx] == 1:
+                x_next[b, layer_idx] = x_next_layer
+
+                if t == 999:  # First step - detailed debug for masked layer
                     print(f"\n    [DETAILED DEBUG] Masked layer {layer_idx}:")
-                    print(f"      x_t_masked: mean={x_t_masked.mean().item():.4f}, std={x_t_masked.std().item():.4f}")
-                    print(f"      noise_pred_masked: mean={noise_pred_masked.mean().item():.4f}, std={noise_pred_masked.std().item():.4f}")
-                    print(f"      sqrt(alpha_t)={torch.sqrt(alpha_t).item():.6f}, sqrt(1-alpha_t)={torch.sqrt(1 - alpha_t).item():.6f}")
+                    print(f"      x_t: mean={x_t_layer.mean().item():.4f}, std={x_t_layer.std().item():.4f}")
+                    print(f"      noise_pred: mean={noise_pred_layer.mean().item():.4f}, std={noise_pred_layer.std().item():.4f}")
+                    print(f"      x0_pred: mean={x0_pred_layer.mean().item():.4f}, std={x0_pred_layer.std().item():.4f}")
+                    print(f"      x_next: mean={x_next_layer.mean().item():.4f}, std={x_next_layer.std().item():.4f}")
 
-                    # 분자 계산
-                    numerator = x_t_masked - torch.sqrt(1 - alpha_t) * noise_pred_masked
-                    print(f"      Numerator (x_t - sqrt(1-α)*noise): mean={numerator.mean().item():.4f}, std={numerator.std().item():.4f}")
-
-                # DDIM formula for this layer only
-                x0_pred_masked = (x_t_masked - torch.sqrt(1 - alpha_t) * noise_pred_masked) / torch.sqrt(alpha_t)
-
-                # Clip x0_pred to reasonable range (VAE latents should be ~N(0,1))
-                # This prevents numerical explosion from inaccurate noise predictions
-                x0_pred_masked = torch.clamp(x0_pred_masked, min=-3.0, max=3.0)
-
-                dir_xt_masked = torch.sqrt(1 - alpha_next) * noise_pred_masked
-                x_next_masked = torch.sqrt(alpha_next) * x0_pred_masked + dir_xt_masked
-
-                # Update only the masked layer
-                x_next[b, layer_idx] = x_next_masked
-
-                if t == 999:  # First step debug
-                    print(f"      x0_pred: mean={x0_pred_masked.mean().item():.4f}, std={x0_pred_masked.std().item():.4f}")
-                    print(f"      x_next: mean={x_next_masked.mean().item():.4f}, std={x_next_masked.std().item():.4f}")
-
-    # Keep visible layers clean (only update masked layer)
+    # Keep visible layers clean (only update masked layer in final output)
     layer_mask_expanded = layer_mask.view(B, -1, 1, 1, 1)
     x_next = x_next * layer_mask_expanded + clean_layers * (1 - layer_mask_expanded)
 
     if t == 999:  # First step
-        print(f"    x_next (after masking): mean={x_next.mean().item():.4f}, has_nan={torch.isnan(x_next).any().item()}\n")
+        print(f"    x_next (final, GT visible): mean={x_next.mean().item():.4f}")
+        print(f"    x_next_model_all (all model pred): mean={x_next_model_all.mean().item():.4f}\n")
 
-    return x_next
+    return x_next, x_next_model_all
 
 
 @torch.no_grad()
@@ -245,6 +243,9 @@ def inpaint_layer(
     x_t = clean_layers.clone()
     x_t[0, masked_idx] = torch.randn(4, h, w, device=device)
 
+    # Track model predictions for ALL layers (for visualization)
+    x_t_model_all = x_t.clone()
+
     print(f"\nInitialization:")
     print(f"  clean_layers stats: mean={clean_layers.mean().item():.4f}, std={clean_layers.std().item():.4f}")
     print(f"  x_t stats: mean={x_t.mean().item():.4f}, std={x_t.std().item():.4f}")
@@ -256,7 +257,8 @@ def inpaint_layer(
         t = timesteps[i].item()
         t_next = timesteps[i + 1].item()
 
-        x_t = ddim_sample_step(
+        # Get both versions: GT visible + model all predictions
+        x_t, x_t_model_all = ddim_sample_step(
             model=model,
             x_t=x_t,
             t=t,
@@ -271,8 +273,9 @@ def inpaint_layer(
 
         # Debug: print stats every 10 steps
         if i % 10 == 0 or i == steps - 1:
-            print(f"  Step {i}/{steps}: x_t mean={x_t.mean().item():.4f}, std={x_t.std().item():.4f}, "
-                  f"min={x_t.min().item():.4f}, max={x_t.max().item():.4f}")
+            print(f"  Step {i}/{steps}:")
+            print(f"    x_t (GT visible): mean={x_t.mean().item():.4f}, std={x_t.std().item():.4f}")
+            print(f"    x_t_model_all: mean={x_t_model_all.mean().item():.4f}, std={x_t_model_all.std().item():.4f}")
 
     # Decode generated layer
     print(f"\nDecoding:")
@@ -285,17 +288,30 @@ def inpaint_layer(
     print(f"  img_generated stats: mean={img_generated.mean().item():.4f}, std={img_generated.std().item():.4f}, "
           f"min={img_generated.min().item():.4f}, max={img_generated.max().item():.4f}")
 
-    # Decode all layers for visualization
-    all_imgs = []
+    # Decode all layers - TWO versions:
+    # 1. x_t: Ground truth visible + Generated masked (final)
+    # 2. x_t_model_all: Model predictions for ALL layers
+    print(f"\n  Decoding all layers (GT visible + generated masked):")
+    all_imgs_gt = []
     for i in range(max_layers):
         z = x_t[0, i:i+1] / 0.18215
         img = vae.decode(z).sample[0]
-        all_imgs.append(img)
-        print(f"  Layer {i}: img mean={img.mean().item():.4f}, std={img.std().item():.4f}")
+        all_imgs_gt.append(img)
+        print(f"    Layer {i}: mean={img.mean().item():.4f}, std={img.std().item():.4f}")
 
-    all_imgs = torch.stack(all_imgs, dim=0)
+    all_imgs_gt = torch.stack(all_imgs_gt, dim=0)
 
-    return img_generated, all_imgs
+    print(f"\n  Decoding all layers (ALL model predictions):")
+    all_imgs_model = []
+    for i in range(max_layers):
+        z = x_t_model_all[0, i:i+1] / 0.18215
+        img = vae.decode(z).sample[0]
+        all_imgs_model.append(img)
+        print(f"    Layer {i}: mean={img.mean().item():.4f}, std={img.std().item():.4f}")
+
+    all_imgs_model = torch.stack(all_imgs_model, dim=0)
+
+    return img_generated, all_imgs_gt, all_imgs_model
 
 
 def main():
@@ -419,7 +435,7 @@ def main():
 
     # Generate
     print("\n[3/5] Generating masked layer...")
-    generated, all_layers = inpaint_layer(
+    generated, all_layers_gt, all_layers_model = inpaint_layer(
         model=model,
         vae=vae,
         diffusion=diffusion,
@@ -440,11 +456,19 @@ def main():
     save_image(generated, args.output, normalize=True, value_range=(-1, 1))
     print(f"  ✓ Generated layer: {args.output}")
 
-    if all_layers is not None:
-        base_name = os.path.splitext(args.output)[0]
-        comparison_path = f"{base_name}_all_layers.png"
-        save_image(all_layers, comparison_path, nrow=len(all_layers), normalize=True, value_range=(-1, 1))
-        print(f"  ✓ All layers: {comparison_path}")
+    base_name = os.path.splitext(args.output)[0]
+
+    # Save all layers (GT visible + generated masked)
+    if all_layers_gt is not None:
+        comparison_path = f"{base_name}_all_layers_gt.png"
+        save_image(all_layers_gt, comparison_path, nrow=len(all_layers_gt), normalize=True, value_range=(-1, 1))
+        print(f"  ✓ All layers (GT visible): {comparison_path}")
+
+    # Save all layers (model predictions for ALL)
+    if all_layers_model is not None:
+        model_pred_path = f"{base_name}_all_layers_model_pred.png"
+        save_image(all_layers_model, model_pred_path, nrow=len(all_layers_model), normalize=True, value_range=(-1, 1))
+        print(f"  ✓ All layers (model pred): {model_pred_path}")
 
     print("\n" + "="*60)
     print("Done!")
