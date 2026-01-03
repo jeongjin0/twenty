@@ -105,8 +105,13 @@ def ddim_sample_step(
     if t == 999:  # First step
         print(f"    alpha_t: {alpha_t.item():.6f}, alpha_next: {alpha_next.item():.6f}")
 
-    # DDIM update
-    # Predict x0
+    # DDIM update - CRITICAL: Only denoise the masked layer!
+    # Visible layers should stay clean (will be restored by masking)
+    # Extract masked layer's noise prediction
+    layer_mask_binary = layer_mask.bool()  # (B, max_layers)
+
+    # Apply DDIM only to masked layer's latent
+    # For all layers: compute x0_pred, but only the masked one will be used
     x0_pred = (x_t - torch.sqrt(1 - alpha_t) * noise_pred) / torch.sqrt(alpha_t)
 
     if t == 999:  # First step
