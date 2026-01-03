@@ -51,6 +51,7 @@ def train():
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', type=str, required=True, help='Path to config file')
     parser.add_argument('--pretrained_pixart', type=str, default=None, help='Pretrained PixArt checkpoint')
+    parser.add_argument('--pretrained_projections', type=str, default=None, help='Pretrained projection weights')
     parser.add_argument('--resume', type=str, default=None, help='Resume from checkpoint')
     args = parser.parse_args()
 
@@ -116,6 +117,36 @@ def train():
     if getattr(config, 'gradient_checkpointing', False):
         model.enable_gradient_checkpointing()
         logger.info("Gradient checkpointing enabled")
+
+    # ============================================
+    # Load Pretrained Projection Weights
+    # ============================================
+    if args.pretrained_projections:
+        logger.info(f"Loading pretrained projections from: {args.pretrained_projections}")
+        pretrained_proj = torch.load(args.pretrained_projections, map_location='cpu')
+
+        # Extract state dict
+        if 'state_dict' in pretrained_proj:
+            proj_state_dict = pretrained_proj['state_dict']
+        else:
+            proj_state_dict = pretrained_proj
+
+        # Load only projection weights
+        model_dict = model.state_dict()
+        proj_dict = {}
+
+        for k, v in proj_state_dict.items():
+            if 'input_proj' in k or 'output_proj' in k:
+                proj_dict[k] = v
+
+        logger.info(f"Loading {len(proj_dict)} projection parameters")
+
+        model_dict.update(proj_dict)
+        model.load_state_dict(model_dict)
+
+        logger.info("✓ Pretrained projections loaded successfully")
+        logger.info("  - Input projection: 6 layers → merged image latent")
+        logger.info("  - Output projection: merged image latent → 6 layers")
 
     # ============================================
     # Build Dataset & Dataloader
