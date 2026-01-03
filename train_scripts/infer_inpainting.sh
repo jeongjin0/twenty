@@ -7,7 +7,7 @@
 # ============================================
 # Configuration
 # ============================================
-CHECKPOINT="output/layer_inpainting_v1/checkpoints/epoch_7_step_35000.pth"
+CHECKPOINT="output/layer_inpainting_v3/checkpoints/epoch_9_step_45000.pth"
 VAE_PATH="/workspace/twenty/PixArt-alpha/sd-vae-ft-ema"
 T5_PATH="/workspace/twenty/PixArt-alpha"
 
@@ -19,7 +19,7 @@ IMAGE_ID="000000581346"  # Example image ID
 MASKED_IDX=2
 
 # Text prompt (you can customize this or read from metadata)
-PROMPT="a layer image"
+PROMPT="a zebra standing on a black background"
 
 # Inference parameters
 # CRITICAL: Model was NOT trained with unconditional (null text)!
