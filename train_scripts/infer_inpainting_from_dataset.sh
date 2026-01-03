@@ -7,7 +7,7 @@
 # ============================================
 # Configuration
 # ============================================
-CHECKPOINT="output/layer_inpainting_v1/checkpoints/epoch_7_step_35000.pth"
+CHECKPOINT="output/layer_inpainting_v3/checkpoints/epoch_9_step_45000.pth"
 VAE_PATH="/workspace/twenty/PixArt-alpha/sd-vae-ft-ema"
 T5_PATH="/workspace/twenty/PixArt-alpha"
 

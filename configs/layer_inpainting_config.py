@@ -26,7 +26,7 @@ gradient_checkpointing = True
 # 2-Stage Training: Freeze PixArt for first N epochs
 # Stage 1: Train projections only (pretrained PixArt frozen)
 # Stage 2: Train full model (PixArt unfrozen)
-pixart_freeze_epochs = 3  # Freeze PixArt for first 5 epochs
+pixart_freeze_epochs = 5  # Freeze PixArt for first 5 epochs
 pixart_unfreeze_lr_scale = 1 # Reduce LR by 50% when unfreezing (optional)
 
 # Optimizer
@@ -62,7 +62,7 @@ save_model_epochs = 5  # Save every 5 epochs
 save_model_steps = 5000  # Save every 5000 steps
 
 # Output
-work_dir = 'output/layer_inpainting_v2'
+work_dir = 'output/layer_inpainting_v3'
 
 # Misc
 seed = 42

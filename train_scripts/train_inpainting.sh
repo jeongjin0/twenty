@@ -5,7 +5,7 @@
 
 export PYTHONPATH="${PYTHONPATH}:/workspace/twenty"
 
-torchrun --nproc_per_node=4 --master_port=29501 \
+torchrun --nproc_per_node=2 --master_port=29501 \
     train_scripts/train_layer_inpainting.py \
     --config configs/layer_inpainting_config.py
 
