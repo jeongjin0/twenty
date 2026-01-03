@@ -120,6 +120,16 @@ def ddim_sample_step(
                 x_t_masked = x_t[b, layer_idx]
                 noise_pred_masked = noise_pred[b, layer_idx]
 
+                if t == 999:  # First step - detailed debug
+                    print(f"\n    [DETAILED DEBUG] Masked layer {layer_idx}:")
+                    print(f"      x_t_masked: mean={x_t_masked.mean().item():.4f}, std={x_t_masked.std().item():.4f}")
+                    print(f"      noise_pred_masked: mean={noise_pred_masked.mean().item():.4f}, std={noise_pred_masked.std().item():.4f}")
+                    print(f"      sqrt(alpha_t)={torch.sqrt(alpha_t).item():.6f}, sqrt(1-alpha_t)={torch.sqrt(1 - alpha_t).item():.6f}")
+
+                    # 분자 계산
+                    numerator = x_t_masked - torch.sqrt(1 - alpha_t) * noise_pred_masked
+                    print(f"      Numerator (x_t - sqrt(1-α)*noise): mean={numerator.mean().item():.4f}, std={numerator.std().item():.4f}")
+
                 # DDIM formula for this layer only
                 x0_pred_masked = (x_t_masked - torch.sqrt(1 - alpha_t) * noise_pred_masked) / torch.sqrt(alpha_t)
                 dir_xt_masked = torch.sqrt(1 - alpha_next) * noise_pred_masked
@@ -129,7 +139,6 @@ def ddim_sample_step(
                 x_next[b, layer_idx] = x_next_masked
 
                 if t == 999:  # First step debug
-                    print(f"    Masked layer {layer_idx}:")
                     print(f"      x0_pred: mean={x0_pred_masked.mean().item():.4f}, std={x0_pred_masked.std().item():.4f}")
                     print(f"      x_next: mean={x_next_masked.mean().item():.4f}, std={x_next_masked.std().item():.4f}")
 
