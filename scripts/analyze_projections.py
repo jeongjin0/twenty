@@ -107,20 +107,12 @@ def analyze_projections(
         y = caption_embs.float()[:, None].to(device)
         y_mask = emb_masks.to(device)
 
-        # Sample timesteps
-        timesteps = torch.randint(0, 1000, (B,), device=device).long()
+        # Use CLEAN latents directly (no noise)
+        # This shows what projections process with clean visible layers
+        z_input = z_clean.clone()
 
-        # Forward diffusion
-        noise = torch.randn_like(z_clean)
-        z_clean_flat = z_clean.reshape(B * N, 4, h, w)
-        noise_flat = noise.reshape(B * N, 4, h, w)
-        timesteps_expanded = timesteps.unsqueeze(1).expand(B, N).reshape(B * N)
-        z_noisy_flat = diffusion.q_sample(z_clean_flat, timesteps_expanded, noise=noise_flat)
-        z_noisy = z_noisy_flat.reshape(B, N, 4, h, w)
-
-        # Replace visible layers with clean latents
-        layer_mask_expanded = layer_mask.view(B, N, 1, 1, 1)
-        z_input = z_noisy * layer_mask_expanded + z_clean * (1 - layer_mask_expanded)
+        # Use a fixed timestep (e.g., t=500) for consistency
+        timesteps = torch.full((B,), 500, device=device, dtype=torch.long)
 
         # Forward pass (hooks will capture input/output)
         noise_pred = model(
