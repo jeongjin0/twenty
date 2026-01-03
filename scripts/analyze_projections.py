@@ -149,22 +149,23 @@ def analyze_projections(
             print(f"    Output shape: {input_proj_out.shape}") # (4, h, w)
 
             # Input: (30, h, w) = 24 layer channels + 6 mask channels
-            # Visualize first 24 channels (layers) and last 6 (masks)
             layer_channels = input_proj_in[:24]  # (24, h, w)
             mask_channels = input_proj_in[24:]   # (6, h, w)
 
-            # Reshape layer channels to (6, 4, h, w) for visualization
+            # Reshape layer channels to (6, 4, h, w)
             layer_channels_reshaped = layer_channels.reshape(6, 4, h, w)
 
-            # Visualize each layer's 4 channels
+            # ========================================
+            # 1a. Input Projection Input - Latent Visualization
+            # ========================================
             fig, axes = plt.subplots(2, 6, figsize=(18, 6))
-            fig.suptitle(f'Input Projection Input - Sample {sample_count}', fontsize=16)
+            fig.suptitle(f'Input Projection Input (Latent) - Sample {sample_count}', fontsize=16)
 
             for i in range(6):
                 # Row 1: Average of 4 channels per layer
                 layer_avg = layer_channels_reshaped[i].mean(dim=0)
                 axes[0, i].imshow(layer_avg, cmap='viridis')
-                axes[0, i].set_title(f'Layer {i}\n(avg 4ch)')
+                axes[0, i].set_title(f'Layer {i}\n(avg 4ch latent)')
                 axes[0, i].axis('off')
 
                 # Row 2: Mask for each layer
@@ -173,12 +174,34 @@ def analyze_projections(
                 axes[1, i].axis('off')
 
             plt.tight_layout()
-            plt.savefig(os.path.join(sample_dir, 'input_proj_input.png'), dpi=150, bbox_inches='tight')
+            plt.savefig(os.path.join(sample_dir, 'input_proj_input_latent.png'), dpi=150, bbox_inches='tight')
             plt.close()
 
-            # Input projection output: (4, h, w)
+            # ========================================
+            # 1b. Input Projection Input - Decoded Images
+            # ========================================
+            print(f"    Decoding input layers...")
+            scale_factor = 0.18215
+
+            # Decode 6 layers
+            input_layers_decoded = []
+            for i in range(6):
+                z = layer_channels_reshaped[i:i+1].to(device) / scale_factor  # (1, 4, h, w)
+                img = vae.decode(z).sample[0]  # (3, H, W)
+                input_layers_decoded.append(img.cpu())
+
+            # Save decoded layers
+            input_layers_tensor = torch.stack(input_layers_decoded, dim=0)
+            save_image(input_layers_tensor,
+                      os.path.join(sample_dir, 'input_proj_input_decoded.png'),
+                      nrow=6, normalize=True, value_range=(-1, 1))
+            print(f"    ✓ Input decoded saved")
+
+            # ========================================
+            # 1c. Input Projection Output - Latent Visualization
+            # ========================================
             fig, axes = plt.subplots(1, 4, figsize=(16, 4))
-            fig.suptitle(f'Input Projection Output - Sample {sample_count}', fontsize=16)
+            fig.suptitle(f'Input Projection Output (Latent) - Sample {sample_count}', fontsize=16)
 
             for i in range(4):
                 axes[i].imshow(input_proj_out[i], cmap='viridis')
@@ -186,8 +209,19 @@ def analyze_projections(
                 axes[i].axis('off')
 
             plt.tight_layout()
-            plt.savefig(os.path.join(sample_dir, 'input_proj_output.png'), dpi=150, bbox_inches='tight')
+            plt.savefig(os.path.join(sample_dir, 'input_proj_output_latent.png'), dpi=150, bbox_inches='tight')
             plt.close()
+
+            # ========================================
+            # 1d. Input Projection Output - Decoded Image
+            # ========================================
+            print(f"    Decoding input projection output...")
+            z = input_proj_out.unsqueeze(0).to(device) / scale_factor  # (1, 4, h, w)
+            img = vae.decode(z).sample[0]  # (3, H, W)
+            save_image(img.cpu(),
+                      os.path.join(sample_dir, 'input_proj_output_decoded.png'),
+                      normalize=True, value_range=(-1, 1))
+            print(f"    ✓ Input projection output decoded saved")
 
             # ========================================
             # 2. Output Projection Visualization
@@ -196,9 +230,11 @@ def analyze_projections(
             print(f"    Input shape: {output_proj_in.shape}")   # (4, h, w)
             print(f"    Output shape: {output_proj_out.shape}") # (24, h, w)
 
-            # Output projection input: (4, h, w)
+            # ========================================
+            # 2a. Output Projection Input - Latent Visualization
+            # ========================================
             fig, axes = plt.subplots(1, 4, figsize=(16, 4))
-            fig.suptitle(f'Output Projection Input - Sample {sample_count}', fontsize=16)
+            fig.suptitle(f'Output Projection Input (Latent) - Sample {sample_count}', fontsize=16)
 
             for i in range(4):
                 axes[i].imshow(output_proj_in[i], cmap='viridis')
@@ -206,14 +242,27 @@ def analyze_projections(
                 axes[i].axis('off')
 
             plt.tight_layout()
-            plt.savefig(os.path.join(sample_dir, 'output_proj_input.png'), dpi=150, bbox_inches='tight')
+            plt.savefig(os.path.join(sample_dir, 'output_proj_input_latent.png'), dpi=150, bbox_inches='tight')
             plt.close()
 
-            # Output projection output: (24, h, w) = 6 layers × 4 channels
+            # ========================================
+            # 2b. Output Projection Input - Decoded Image
+            # ========================================
+            print(f"    Decoding output projection input...")
+            z = output_proj_in.unsqueeze(0).to(device) / scale_factor  # (1, 4, h, w)
+            img = vae.decode(z).sample[0]  # (3, H, W)
+            save_image(img.cpu(),
+                      os.path.join(sample_dir, 'output_proj_input_decoded.png'),
+                      normalize=True, value_range=(-1, 1))
+            print(f"    ✓ Output projection input decoded saved")
+
+            # ========================================
+            # 2c. Output Projection Output - Latent Visualization
+            # ========================================
             output_channels_reshaped = output_proj_out.reshape(6, 4, h, w)
 
             fig, axes = plt.subplots(1, 6, figsize=(18, 3))
-            fig.suptitle(f'Output Projection Output - Sample {sample_count}', fontsize=16)
+            fig.suptitle(f'Output Projection Output (Latent) - Sample {sample_count}', fontsize=16)
 
             for i in range(6):
                 # Average of 4 channels per layer
@@ -224,8 +273,27 @@ def analyze_projections(
                 axes[i].axis('off')
 
             plt.tight_layout()
-            plt.savefig(os.path.join(sample_dir, 'output_proj_output.png'), dpi=150, bbox_inches='tight')
+            plt.savefig(os.path.join(sample_dir, 'output_proj_output_latent.png'), dpi=150, bbox_inches='tight')
             plt.close()
+
+            # ========================================
+            # 2d. Output Projection Output - Decoded Images
+            # ========================================
+            print(f"    Decoding output layers...")
+
+            # Decode 6 layers
+            output_layers_decoded = []
+            for i in range(6):
+                z = output_channels_reshaped[i:i+1].to(device) / scale_factor  # (1, 4, h, w)
+                img = vae.decode(z).sample[0]  # (3, H, W)
+                output_layers_decoded.append(img.cpu())
+
+            # Save decoded layers
+            output_layers_tensor = torch.stack(output_layers_decoded, dim=0)
+            save_image(output_layers_tensor,
+                      os.path.join(sample_dir, 'output_proj_output_decoded.png'),
+                      nrow=6, normalize=True, value_range=(-1, 1))
+            print(f"    ✓ Output decoded saved")
 
             # ========================================
             # 3. Statistics
