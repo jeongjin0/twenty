@@ -324,8 +324,25 @@ def main():
         state_dict = ckpt
         print(f"  ✓ Using checkpoint as-is")
 
-    model.load_state_dict(state_dict, strict=False)
+    missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
     print(f"  ✓ Model loaded from {args.checkpoint}")
+
+    # CRITICAL: Check if projections were loaded
+    if missing_keys:
+        print(f"\n  ⚠️ WARNING: Missing keys during checkpoint loading:")
+        projection_missing = [k for k in missing_keys if 'proj' in k]
+        if projection_missing:
+            print(f"    CRITICAL: Projection layers not loaded! ({len(projection_missing)} keys)")
+            print(f"    This means projections are RANDOM INITIALIZED!")
+            print(f"    First few missing: {projection_missing[:5]}")
+            print(f"\n    ❌ ERROR: Checkpoint incompatible with current model architecture!")
+            print(f"    Make sure you're using a checkpoint trained with multi-layer projections.")
+            sys.exit(1)
+        else:
+            print(f"    Non-critical keys: {len(missing_keys)}")
+
+    if unexpected_keys:
+        print(f"  ℹ️ Unexpected keys: {len(unexpected_keys)}")
 
     # Check y_embedder.y_embedding for NaN
     print(f"\n  [CRITICAL CHECK] y_embedder.y_embedding:")
