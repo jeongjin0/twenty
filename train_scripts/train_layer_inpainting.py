@@ -394,27 +394,44 @@ def train():
                 )
 
                 # ========================================
-                # Compute loss (only on masked layer)
+                # Compute loss (masked + visible layers)
                 # ========================================
                 # If pred_sigma=True, output is (B, max_layers, 8, h, w)
                 if config.pred_sigma and noise_pred.shape[2] == 8:
                     noise_pred = noise_pred[:, :, :4]  # Take only noise prediction
 
-                # MSE loss
-                layer_loss = F.mse_loss(
+                # Create valid layer mask (excluding padding)
+                valid_mask = torch.zeros(B, max_layers, device=accelerator.device)
+                for b in range(B):
+                    n_valid = num_layers[b].item()
+                    valid_mask[b, :n_valid] = 1
+
+                # Loss 1: Masked layer (predict actual noise)
+                masked_noise_loss = F.mse_loss(
                     noise_pred,
                     noise,
                     reduction='none'
-                )  # (B, max_layers, 4, h, w)
+                ).mean(dim=[2, 3, 4])  # (B, max_layers)
 
-                # Average over spatial and channel dims
-                layer_loss = layer_loss.mean(dim=[2, 3, 4])  # (B, max_layers)
+                masked_loss = (masked_noise_loss * layer_mask).sum() / layer_mask.sum()
 
-                # Apply layer mask (only masked layer)
-                masked_loss = (layer_loss * layer_mask).sum() / layer_mask.sum()
+                # Loss 2: Visible layers (should predict zero noise since they're clean)
+                visible_mask = (1 - layer_mask) * valid_mask  # Valid but not masked
+
+                visible_noise_loss = F.mse_loss(
+                    noise_pred,
+                    torch.zeros_like(noise),
+                    reduction='none'
+                ).mean(dim=[2, 3, 4])  # (B, max_layers)
+
+                visible_loss = (visible_noise_loss * visible_mask).sum() / (visible_mask.sum() + 1e-8)
+
+                # Total loss
+                visible_weight = getattr(config, 'visible_loss_weight', 0.5)
+                total_loss = masked_loss + visible_weight * visible_loss
 
                 # Backward
-                accelerator.backward(masked_loss)
+                accelerator.backward(total_loss)
 
                 # Gradient clipping
                 if accelerator.sync_gradients:
@@ -432,7 +449,11 @@ def train():
             # Logging
             # ========================================
             lr = lr_scheduler.get_last_lr()[0]
-            logs = {'loss': accelerator.gather(masked_loss).mean().item()}
+            logs = {
+                'loss': accelerator.gather(total_loss).mean().item(),
+                'masked': accelerator.gather(masked_loss).mean().item(),
+                'visible': accelerator.gather(visible_loss).mean().item()
+            }
             if grad_norm is not None:
                 logs.update(grad_norm=accelerator.gather(grad_norm).mean().item())
             log_buffer.update(logs)
