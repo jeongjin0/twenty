@@ -132,6 +132,11 @@ def ddim_sample_step(
 
                 # DDIM formula for this layer only
                 x0_pred_masked = (x_t_masked - torch.sqrt(1 - alpha_t) * noise_pred_masked) / torch.sqrt(alpha_t)
+
+                # Clip x0_pred to reasonable range (VAE latents should be ~N(0,1))
+                # This prevents numerical explosion from inaccurate noise predictions
+                x0_pred_masked = torch.clamp(x0_pred_masked, min=-3.0, max=3.0)
+
                 dir_xt_masked = torch.sqrt(1 - alpha_next) * noise_pred_masked
                 x_next_masked = torch.sqrt(alpha_next) * x0_pred_masked + dir_xt_masked
 
