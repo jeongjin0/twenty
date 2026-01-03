@@ -22,7 +22,11 @@ MASKED_IDX=2
 PROMPT="a layer image"
 
 # Inference parameters
-CFG_SCALE=4.5
+# CRITICAL: Model was NOT trained with unconditional (null text)!
+# CFG requires unconditional training to work properly.
+# Using CFG without unconditional training causes colorful noise.
+# Solution: Set CFG_SCALE=1.0 (no CFG, conditional only)
+CFG_SCALE=1.0  # Was 4.5, but model doesn't support CFG yet
 STEPS=50
 MAX_LAYERS=6
 IMAGE_SIZE=256
