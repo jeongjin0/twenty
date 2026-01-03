@@ -106,25 +106,32 @@ def ddim_sample_step(
         print(f"    alpha_t: {alpha_t.item():.6f}, alpha_next: {alpha_next.item():.6f}")
 
     # DDIM update - CRITICAL: Only denoise the masked layer!
-    # Visible layers should stay clean (will be restored by masking)
-    # Extract masked layer's noise prediction
-    layer_mask_binary = layer_mask.bool()  # (B, max_layers)
+    # Model predicts noise for all 6 layers, but only masked layer's prediction is trained
+    # Using untrained predictions for visible layers causes numerical instability
 
-    # Apply DDIM only to masked layer's latent
-    # For all layers: compute x0_pred, but only the masked one will be used
-    x0_pred = (x_t - torch.sqrt(1 - alpha_t) * noise_pred) / torch.sqrt(alpha_t)
+    # Initialize x_next with current x_t (visible layers will stay unchanged)
+    x_next = x_t.clone()
 
-    if t == 999:  # First step
-        print(f"    x0_pred: mean={x0_pred.mean().item():.4f}, has_nan={torch.isnan(x0_pred).any().item()}")
+    # Apply DDIM ONLY to masked layer
+    for b in range(B):
+        for layer_idx in range(x_t.shape[1]):
+            if layer_mask[b, layer_idx] == 1:  # This is the masked layer
+                # Extract masked layer's latent and noise prediction
+                x_t_masked = x_t[b, layer_idx]
+                noise_pred_masked = noise_pred[b, layer_idx]
 
-    # Direction pointing to x_t
-    dir_xt = torch.sqrt(1 - alpha_next) * noise_pred
+                # DDIM formula for this layer only
+                x0_pred_masked = (x_t_masked - torch.sqrt(1 - alpha_t) * noise_pred_masked) / torch.sqrt(alpha_t)
+                dir_xt_masked = torch.sqrt(1 - alpha_next) * noise_pred_masked
+                x_next_masked = torch.sqrt(alpha_next) * x0_pred_masked + dir_xt_masked
 
-    # Next sample
-    x_next = torch.sqrt(alpha_next) * x0_pred + dir_xt
+                # Update only the masked layer
+                x_next[b, layer_idx] = x_next_masked
 
-    if t == 999:  # First step
-        print(f"    x_next (before masking): mean={x_next.mean().item():.4f}, has_nan={torch.isnan(x_next).any().item()}")
+                if t == 999:  # First step debug
+                    print(f"    Masked layer {layer_idx}:")
+                    print(f"      x0_pred: mean={x0_pred_masked.mean().item():.4f}, std={x0_pred_masked.std().item():.4f}")
+                    print(f"      x_next: mean={x_next_masked.mean().item():.4f}, std={x_next_masked.std().item():.4f}")
 
     # Keep visible layers clean (only update masked layer)
     layer_mask_expanded = layer_mask.view(B, -1, 1, 1, 1)
