@@ -443,7 +443,13 @@ def train():
             original_masked_indices = []  # Store original (pre-shuffle) masked index
             for b in range(B):
                 n_valid = num_layers[b].item()
-                masked_idx = torch.randint(0, n_valid, (1,)).item()
+                # Never mask layer 0 (background) - always keep it as reference
+                # Sample from layers 1 to n_valid-1
+                if n_valid > 1:
+                    masked_idx = torch.randint(1, n_valid, (1,)).item()
+                else:
+                    # Edge case: only 1 layer (shouldn't happen with min_layers=2)
+                    masked_idx = 0
                 original_masked_indices.append(masked_idx)
 
                 # If shuffled, find where this layer ended up
