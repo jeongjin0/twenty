@@ -406,29 +406,63 @@ def train():
                     n_valid = num_layers[b].item()
                     valid_mask[b, :n_valid] = 1
 
-                # Loss 1: Masked layer (predict actual noise)
-                masked_noise_loss = F.mse_loss(
+                # Compute noise prediction loss (per layer)
+                noise_loss = F.mse_loss(
                     noise_pred,
                     noise,
                     reduction='none'
                 ).mean(dim=[2, 3, 4])  # (B, max_layers)
 
-                masked_loss = (masked_noise_loss * layer_mask).sum() / layer_mask.sum()
-
-                # Loss 2: Visible layers (should predict zero noise since they're clean)
-                visible_mask = (1 - layer_mask) * valid_mask  # Valid but not masked
-
-                visible_noise_loss = F.mse_loss(
+                # Compute zero-noise loss for visible layers
+                zero_noise_loss = F.mse_loss(
                     noise_pred,
                     torch.zeros_like(noise),
                     reduction='none'
                 ).mean(dim=[2, 3, 4])  # (B, max_layers)
 
-                visible_loss = (visible_noise_loss * visible_mask).sum() / (visible_mask.sum() + 1e-8)
+                # Create weighted loss mask
+                loss_weight_mask = torch.zeros(B, max_layers, device=accelerator.device)
 
-                # Total loss
-                visible_weight = getattr(config, 'visible_loss_weight', 0.5)
-                total_loss = masked_loss + visible_weight * visible_loss
+                masked_layer_weight = getattr(config, 'masked_layer_weight', 1.0)
+                visible_layer_weight = getattr(config, 'visible_layer_weight', 0.5)
+                background_layer_weight = getattr(config, 'background_layer_weight', 0.3)
+
+                for b in range(B):
+                    n_valid = num_layers[b].item()
+                    for i in range(n_valid):
+                        # Determine layer type and weight
+                        is_masked = layer_mask[b, i].item() == 1
+                        is_background = (i == 0)
+
+                        if is_masked:
+                            # Masked (target) layer: highest weight
+                            weight = masked_layer_weight
+                        elif is_background:
+                            # Background layer: lowest weight
+                            weight = visible_layer_weight * background_layer_weight
+                        else:
+                            # Visible (reference) layers: medium weight
+                            weight = visible_layer_weight
+
+                        loss_weight_mask[b, i] = weight
+
+                # Compute weighted loss
+                # Masked layer: predict actual noise
+                # Visible layers: predict zero noise (since they're clean)
+                combined_loss = torch.zeros(B, max_layers, device=accelerator.device)
+                for b in range(B):
+                    for i in range(max_layers):
+                        if layer_mask[b, i] == 1:  # Masked
+                            combined_loss[b, i] = noise_loss[b, i]
+                        elif valid_mask[b, i] == 1:  # Visible
+                            combined_loss[b, i] = zero_noise_loss[b, i]
+
+                total_loss = (combined_loss * loss_weight_mask).sum() / (loss_weight_mask.sum() + 1e-8)
+
+                # For logging
+                masked_loss = (noise_loss * layer_mask).sum() / (layer_mask.sum() + 1e-8)
+                visible_mask = (1 - layer_mask) * valid_mask
+                visible_loss = (zero_noise_loss * visible_mask).sum() / (visible_mask.sum() + 1e-8)
 
                 # Backward
                 accelerator.backward(total_loss)

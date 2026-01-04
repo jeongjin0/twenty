@@ -302,6 +302,9 @@ def train():
     parser.add_argument('--batch_size', type=int, default=4)
     parser.add_argument('--merge_weight', type=float, default=1.0, help='Weight for merge loss')
     parser.add_argument('--decompose_weight', type=float, default=1.0, help='Weight for decompose loss')
+    parser.add_argument('--masked_layer_weight', type=float, default=2.0, help='Extra weight for masked layer in decompose loss')
+    parser.add_argument('--background_layer_weight', type=float, default=0.5, help='Weight for layer 0 (background) in decompose loss')
+    parser.add_argument('--shuffle_layers', action='store_true', help='Shuffle layer order for order-invariant learning')
     args = parser.parse_args()
 
     config = read_config(args.config)
@@ -416,42 +419,94 @@ def train():
                 layers_latent_gt = z_flat.reshape(B, N, 4, h, w)
 
             # ========================================
-            # 3. Random layer masking
+            # 3. Layer order shuffling (optional)
+            # ========================================
+            shuffle_indices = []
+            if args.shuffle_layers:
+                # Shuffle layer order for each sample
+                layers_latent_input = torch.zeros_like(layers_latent_gt)
+                for b in range(B):
+                    n_valid = num_layers[b].item()
+                    # Random permutation of valid layers
+                    perm = torch.randperm(n_valid)
+                    shuffle_indices.append(perm)
+                    # Apply permutation
+                    layers_latent_input[b, :n_valid] = layers_latent_gt[b, perm]
+            else:
+                layers_latent_input = layers_latent_gt
+                shuffle_indices = [torch.arange(num_layers[b].item()) for b in range(B)]
+
+            # ========================================
+            # 4. Random layer masking
             # ========================================
             layer_mask = torch.zeros(B, N, device=accelerator.device)
+            original_masked_indices = []  # Store original (pre-shuffle) masked index
             for b in range(B):
                 n_valid = num_layers[b].item()
                 masked_idx = torch.randint(0, n_valid, (1,)).item()
-                layer_mask[b, masked_idx] = 1
+                original_masked_indices.append(masked_idx)
+
+                # If shuffled, find where this layer ended up
+                if args.shuffle_layers:
+                    shuffled_idx = (shuffle_indices[b] == masked_idx).nonzero(as_tuple=True)[0].item()
+                    layer_mask[b, shuffled_idx] = 1
+                else:
+                    layer_mask[b, masked_idx] = 1
 
             # ========================================
-            # 4. Forward pass
+            # 5. Forward pass
             # ========================================
             optimizer.zero_grad()
 
-            merged_pred, layers_recon = model(layers_latent_gt, layer_mask)
+            merged_pred, layers_recon = model(layers_latent_input, layer_mask)
 
             # ========================================
-            # 5. Loss computation
+            # 6. Loss computation
             # ========================================
             # Loss 1: Merge loss (input projection)
             # Predicted merged latent should match ground truth
             merge_loss = F.mse_loss(merged_pred, merged_latent_gt)
 
             # Loss 2: Decompose loss (output projection)
-            # Reconstructed layers should match ground truth
-            # Only compute loss on valid layers
-            valid_mask = torch.zeros(B, N, device=accelerator.device)
+            # Reconstructed layers should match ORIGINAL (non-shuffled) ground truth
+            # Need to unshuffle the reconstruction for comparison
+            if args.shuffle_layers:
+                layers_recon_unshuffled = torch.zeros_like(layers_recon)
+                for b in range(B):
+                    n_valid = num_layers[b].item()
+                    # Inverse permutation
+                    inv_perm = torch.argsort(shuffle_indices[b])
+                    layers_recon_unshuffled[b, :n_valid] = layers_recon[b, inv_perm]
+            else:
+                layers_recon_unshuffled = layers_recon
+
+            # Compute per-layer loss
+            decompose_loss_per_layer = F.mse_loss(layers_recon_unshuffled, layers_latent_gt, reduction='none')
+            decompose_loss_per_layer = decompose_loss_per_layer.mean(dim=[2, 3, 4])  # (B, N)
+
+            # Create weighted mask
+            loss_weight_mask = torch.zeros(B, N, device=accelerator.device)
             for b in range(B):
                 n_valid = num_layers[b].item()
-                valid_mask[b, :n_valid] = 1
+                for i in range(n_valid):
+                    # Base weight: 1.0
+                    weight = 1.0
 
-            decompose_loss_per_layer = F.mse_loss(layers_recon, layers_latent_gt, reduction='none')
-            decompose_loss_per_layer = decompose_loss_per_layer.mean(dim=[2, 3, 4])  # (B, N)
-            decompose_loss = (decompose_loss_per_layer * valid_mask).sum() / valid_mask.sum()
+                    # Layer 0 (background): lower weight
+                    if i == 0:
+                        weight *= args.background_layer_weight
+
+                    # Masked layer: higher weight
+                    if i == original_masked_indices[b]:
+                        weight *= args.masked_layer_weight
+
+                    loss_weight_mask[b, i] = weight
+
+            # Weighted decompose loss
+            weighted_decompose_loss = (decompose_loss_per_layer * loss_weight_mask).sum() / loss_weight_mask.sum()
 
             # Total loss
-            total_loss = args.merge_weight * merge_loss + args.decompose_weight * decompose_loss
+            total_loss = args.merge_weight * merge_loss + args.decompose_weight * weighted_decompose_loss
 
             # Backward
             accelerator.backward(total_loss)
@@ -462,7 +517,7 @@ def train():
             # Logging
             total_loss_sum += total_loss.item()
             merge_loss_sum += merge_loss.item()
-            decompose_loss_sum += decompose_loss.item()
+            decompose_loss_sum += weighted_decompose_loss.item()
             count += 1
 
             if (step + 1) % 50 == 0:

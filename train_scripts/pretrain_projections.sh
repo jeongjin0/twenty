@@ -11,6 +11,9 @@ LR=1e-4
 BATCH_SIZE=4
 MERGE_WEIGHT=1.0
 DECOMPOSE_WEIGHT=1.0
+MASKED_LAYER_WEIGHT=2.0  # Masked layer gets higher weight
+BACKGROUND_LAYER_WEIGHT=0.5  # Layer 0 (background) gets lower weight
+SHUFFLE_LAYERS="--shuffle_layers"  # Enable layer order shuffling
 
 echo "============================================"
 echo "Projection Pretraining"
@@ -51,7 +54,10 @@ accelerate launch \
     --lr ${LR} \
     --batch_size ${BATCH_SIZE} \
     --merge_weight ${MERGE_WEIGHT} \
-    --decompose_weight ${DECOMPOSE_WEIGHT}
+    --decompose_weight ${DECOMPOSE_WEIGHT} \
+    --masked_layer_weight ${MASKED_LAYER_WEIGHT} \
+    --background_layer_weight ${BACKGROUND_LAYER_WEIGHT} \
+    ${SHUFFLE_LAYERS}
 
 echo ""
 echo "============================================"
