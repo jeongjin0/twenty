@@ -339,7 +339,12 @@ def train():
                 # num_layers[b] is the actual number of valid layers for this sample
                 n_valid = num_layers[b].item()
                 # Randomly select ONE layer to mask (from valid layers only)
-                masked_idx = random.randint(0, n_valid - 1)
+                # Never mask layer 0 (background) - always keep it as reference
+                if n_valid > 1:
+                    masked_idx = random.randint(1, n_valid - 1)
+                else:
+                    # Edge case: only 1 layer (shouldn't happen with min_layers=2)
+                    masked_idx = 0
                 layer_mask[b, masked_idx] = 1
 
                 # Use the masked layer's caption
