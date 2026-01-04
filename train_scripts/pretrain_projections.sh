@@ -11,14 +11,12 @@ LR=1e-4
 BATCH_SIZE=4
 MERGE_WEIGHT=1.0
 DECOMPOSE_WEIGHT=1.0
-MASKED_LAYER_WEIGHT=2.0  # Masked layer gets higher weight
-BACKGROUND_LAYER_WEIGHT=0.5  # Layer 0 (background) gets lower weight
-SHUFFLE_LAYERS="--shuffle_layers"  # Enable layer order shuffling
+BACKGROUND_WEIGHT=0.5  # Layer 0 (background) gets lower weight
 
 echo "============================================"
-echo "Projection Pretraining"
+echo "Projection Pretraining - Optimal Assignment"
 echo "============================================"
-echo "Strategy: Merge (compositing) ↔ Decompose (separation)"
+echo "Strategy: Order-invariant Merge/Decompose with Hungarian matching"
 echo ""
 echo "Input Projection:"
 echo "  6 layers → merged image latent"
@@ -55,9 +53,7 @@ accelerate launch \
     --batch_size ${BATCH_SIZE} \
     --merge_weight ${MERGE_WEIGHT} \
     --decompose_weight ${DECOMPOSE_WEIGHT} \
-    --masked_layer_weight ${MASKED_LAYER_WEIGHT} \
-    --background_layer_weight ${BACKGROUND_LAYER_WEIGHT} \
-    ${SHUFFLE_LAYERS}
+    --background_weight ${BACKGROUND_WEIGHT}
 
 echo ""
 echo "============================================"

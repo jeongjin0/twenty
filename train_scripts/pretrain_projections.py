@@ -19,6 +19,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from diffusers.models import AutoencoderKL
 from tqdm import tqdm
+from scipy.optimize import linear_sum_assignment
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -64,20 +65,83 @@ def alpha_blend_layers(layers, num_layers):
     return merged
 
 
+def optimal_assignment_loss(pred_layers, gt_layers, num_valid, background_weight=0.5):
+    """
+    Compute loss using optimal assignment (Hungarian algorithm)
+
+    Args:
+        pred_layers: (B, N, C, H, W) - predicted layers (any order)
+        gt_layers: (B, N, C, H, W) - ground truth layers (canonical order)
+        num_valid: (B,) - number of valid layers per sample
+        background_weight: weight for layer 0 (background)
+
+    Returns:
+        total_loss: scalar loss
+        assignments: list of (pred_idx, gt_idx) tuples for each batch
+    """
+    B, N, C, H, W = pred_layers.shape
+    device = pred_layers.device
+
+    total_loss = 0.0
+    all_assignments = []
+
+    for b in range(B):
+        n_valid = num_valid[b].item()
+
+        # Compute cost matrix (without gradients for assignment)
+        with torch.no_grad():
+            cost = torch.zeros(N, N, device=device)
+
+            for i in range(N):  # pred index
+                for j in range(n_valid):  # valid GT index
+                    # MSE between pred[i] and gt[j]
+                    cost[i, j] = F.mse_loss(
+                        pred_layers[b, i],
+                        gt_layers[b, j],
+                        reduction='mean'
+                    ).item()
+
+                # Padding GT layers
+                for j in range(n_valid, N):
+                    if i < n_valid:
+                        # Valid pred should not match padding
+                        cost[i, j] = 1e8
+                    else:
+                        # Padding pred -> padding GT (zero cost)
+                        cost[i, j] = 0.0
+
+            # Hungarian algorithm for optimal assignment
+            pred_idx, gt_idx = linear_sum_assignment(cost.cpu().numpy())
+
+        all_assignments.append((pred_idx, gt_idx))
+
+        # Compute loss with gradients using the assignment
+        for i, j in zip(pred_idx, gt_idx):
+            if j < n_valid:  # Valid layer
+                layer_loss = F.mse_loss(pred_layers[b, i], gt_layers[b, j])
+
+                # Apply weight for background (layer 0)
+                weight = background_weight if j == 0 else 1.0
+                total_loss += weight * layer_loss
+
+    return total_loss / B, all_assignments
+
+
 class ProjectionAutoencoder(nn.Module):
     """
-    Autoencoder using input_proj (merge) and output_proj (decompose)
+    Order-invariant Autoencoder for merge/decompose
+    No mask input - pure compositional learning
     """
 
     def __init__(self, max_layers=6):
         super().__init__()
         self.max_layers = max_layers
 
-        input_channels = max_layers * 4 + max_layers  # 24 + 6 = 30
+        input_channels = max_layers * 4  # 24 (no mask!)
         output_channels = max_layers * 4  # 24
 
         # Input projection: 6 layers → merged image
-        # (30, h, w) → (4, h, w)
+        # (24, h, w) → (4, h, w)
         self.input_proj = nn.Sequential(
             nn.Conv2d(input_channels, 64, kernel_size=3, padding=1),
             nn.GroupNorm(8, 64),
@@ -100,29 +164,22 @@ class ProjectionAutoencoder(nn.Module):
             nn.Conv2d(64, output_channels, kernel_size=1),
         )
 
-    def forward(self, layers, layer_mask):
+    def forward(self, layers):
         """
         Args:
-            layers: (B, N, 4, h, w) - layer latents
-            layer_mask: (B, N) - binary mask
+            layers: (B, N, 4, h, w) - layer latents (any order)
 
         Returns:
             merged_pred: (B, 4, h, w) - predicted merged image latent
-            layers_recon: (B, N, 4, h, w) - reconstructed layer latents
+            layers_recon: (B, N, 4, h, w) - reconstructed layer latents (any order)
         """
         B, N, C, h, w = layers.shape
 
         # Flatten layers
         layers_flat = layers.reshape(B, N * C, h, w)  # (B, 24, h, w)
 
-        # Expand mask
-        mask_spatial = layer_mask.unsqueeze(-1).unsqueeze(-1).expand(B, N, h, w)
-
-        # Concatenate
-        x = torch.cat([layers_flat, mask_spatial], dim=1)  # (B, 30, h, w)
-
         # Input projection: layers → merged image latent
-        merged_pred = self.input_proj(x)  # (B, 4, h, w)
+        merged_pred = self.input_proj(layers_flat)  # (B, 4, h, w)
 
         # Output projection: merged image latent → layers
         layers_recon_flat = self.output_proj(merged_pred)  # (B, 24, h, w)
@@ -186,18 +243,21 @@ def visualize_predictions(model, dataloader, vae, epoch, output_dir, num_samples
         # ========================================
         # 3. Model prediction
         # ========================================
-        # Create random layer mask
-        layer_mask = torch.zeros(B, N, device=device)
-        for b in range(B):
-            n_valid = num_layers[b].item()
-            masked_idx = torch.randint(0, n_valid, (1,)).item()
-            layer_mask[b, masked_idx] = 1
-
-        # Forward pass
-        merged_pred, layers_recon = model(layers_latent_gt, layer_mask)
+        # Forward pass (no mask needed)
+        merged_pred, layers_recon = model(layers_latent_gt)
 
         # ========================================
-        # 4. Decode predictions
+        # 4. Compute optimal assignment for visualization
+        # ========================================
+        _, assignments = optimal_assignment_loss(
+            layers_recon,
+            layers_latent_gt,
+            num_layers,
+            background_weight=0.5
+        )
+
+        # ========================================
+        # 5. Decode predictions
         # ========================================
         # Decode merged image
         merged_rgb_pred = vae.decode(merged_pred / scale_factor).sample
@@ -208,7 +268,7 @@ def visualize_predictions(model, dataloader, vae, epoch, output_dir, num_samples
         layers_rgb_recon = layers_rgb_recon_flat.reshape(B, N, 3, H, W)
 
         # ========================================
-        # 5. Save visualizations
+        # 6. Save visualizations
         # ========================================
         for b in range(B):
             if sample_count >= num_samples:
@@ -218,8 +278,9 @@ def visualize_predictions(model, dataloader, vae, epoch, output_dir, num_samples
             os.makedirs(sample_dir, exist_ok=True)
 
             n_valid = num_layers[b].item()
+            pred_idx, gt_idx = assignments[b]
 
-            # 5a. Merged images comparison
+            # 6a. Merged images comparison
             fig, axes = plt.subplots(1, 2, figsize=(10, 5))
 
             # GT merged
@@ -240,51 +301,57 @@ def visualize_predictions(model, dataloader, vae, epoch, output_dir, num_samples
             plt.savefig(os.path.join(sample_dir, 'merged_comparison.png'), dpi=150, bbox_inches='tight')
             plt.close()
 
-            # 5b. Layers comparison
+            # 6b. Layers comparison (using optimal assignment)
             fig, axes = plt.subplots(2, 6, figsize=(18, 6))
-            fig.suptitle(f'Layers Comparison - Sample {sample_count}', fontsize=16)
+            fig.suptitle(f'Layers Comparison - Sample {sample_count} (Optimal Assignment)', fontsize=16)
 
-            for i in range(6):
+            for gt_i in range(6):
                 # GT layer
-                if i < n_valid:
-                    img_gt = layers_rgb[b, i].cpu().permute(1, 2, 0).numpy()
+                if gt_i < n_valid:
+                    img_gt = layers_rgb[b, gt_i].cpu().permute(1, 2, 0).numpy()
                     img_gt = (img_gt + 1.0) / 2.0
-                    axes[0, i].imshow(img_gt.clip(0, 1))
-                    axes[0, i].set_title(f'GT Layer {i}')
+                    axes[0, gt_i].imshow(img_gt.clip(0, 1))
+                    axes[0, gt_i].set_title(f'GT Layer {gt_i}')
                 else:
-                    axes[0, i].imshow(torch.zeros(H, W, 3).numpy())
-                    axes[0, i].set_title(f'Padding {i}')
-                axes[0, i].axis('off')
+                    axes[0, gt_i].imshow(torch.zeros(H, W, 3).numpy())
+                    axes[0, gt_i].set_title(f'Padding')
+                axes[0, gt_i].axis('off')
 
-                # Reconstructed layer
-                if i < n_valid:
-                    img_recon = layers_rgb_recon[b, i].cpu().permute(1, 2, 0).numpy()
+                # Find which pred matches this GT
+                matching_pred = None
+                for p, g in zip(pred_idx, gt_idx):
+                    if g == gt_i:
+                        matching_pred = p
+                        break
+
+                # Reconstructed layer (matched)
+                if matching_pred is not None and gt_i < n_valid:
+                    img_recon = layers_rgb_recon[b, matching_pred].cpu().permute(1, 2, 0).numpy()
                     img_recon = (img_recon + 1.0) / 2.0
-                    axes[1, i].imshow(img_recon.clip(0, 1))
-                    is_masked = layer_mask[b, i].item() == 1
-                    axes[1, i].set_title(f'Recon {i}\n{"[MASKED]" if is_masked else "[visible]"}')
+                    axes[1, gt_i].imshow(img_recon.clip(0, 1))
+                    axes[1, gt_i].set_title(f'Pred[{matching_pred}]→GT[{gt_i}]')
                 else:
-                    axes[1, i].imshow(torch.zeros(H, W, 3).numpy())
-                    axes[1, i].set_title(f'Padding {i}')
-                axes[1, i].axis('off')
+                    axes[1, gt_i].imshow(torch.zeros(H, W, 3).numpy())
+                    axes[1, gt_i].set_title(f'Padding')
+                axes[1, gt_i].axis('off')
 
             plt.tight_layout()
             plt.savefig(os.path.join(sample_dir, 'layers_comparison.png'), dpi=150, bbox_inches='tight')
             plt.close()
 
-            # 5c. Loss statistics
+            # 6c. Loss statistics
             with open(os.path.join(sample_dir, 'stats.txt'), 'w') as f:
                 merge_mse = F.mse_loss(merged_pred[b], merged_latent_gt[b]).item()
 
-                # Per-layer decompose loss
                 f.write(f"Sample {sample_count} - {image_ids[b]}\n")
                 f.write("="*60 + "\n\n")
                 f.write(f"Merge Loss (MSE): {merge_mse:.6f}\n\n")
-                f.write("Decompose Loss per Layer:\n")
-                for i in range(n_valid):
-                    layer_mse = F.mse_loss(layers_recon[b, i], layers_latent_gt[b, i]).item()
-                    is_masked = layer_mask[b, i].item() == 1
-                    f.write(f"  Layer {i} {'[MASKED]' if is_masked else '[visible]'}: {layer_mse:.6f}\n")
+                f.write("Optimal Assignment:\n")
+                for p, g in zip(pred_idx, gt_idx):
+                    if g < n_valid:
+                        layer_mse = F.mse_loss(layers_recon[b, p], layers_latent_gt[b, g]).item()
+                        bg_marker = " [BG]" if g == 0 else ""
+                        f.write(f"  Pred[{p}] -> GT[{g}]{bg_marker}: MSE={layer_mse:.6f}\n")
 
             print(f"  ✓ Saved visualization: {sample_dir}")
             sample_count += 1
@@ -302,9 +369,7 @@ def train():
     parser.add_argument('--batch_size', type=int, default=4)
     parser.add_argument('--merge_weight', type=float, default=1.0, help='Weight for merge loss')
     parser.add_argument('--decompose_weight', type=float, default=1.0, help='Weight for decompose loss')
-    parser.add_argument('--masked_layer_weight', type=float, default=2.0, help='Extra weight for masked layer in decompose loss')
-    parser.add_argument('--background_layer_weight', type=float, default=0.5, help='Weight for layer 0 (background) in decompose loss')
-    parser.add_argument('--shuffle_layers', action='store_true', help='Shuffle layer order for order-invariant learning')
+    parser.add_argument('--background_weight', type=float, default=0.5, help='Weight for layer 0 (background)')
     args = parser.parse_args()
 
     config = read_config(args.config)
@@ -419,100 +484,28 @@ def train():
                 layers_latent_gt = z_flat.reshape(B, N, 4, h, w)
 
             # ========================================
-            # 3. Layer order shuffling (optional)
-            # ========================================
-            shuffle_indices = []
-            if args.shuffle_layers:
-                # Shuffle layer order for each sample
-                layers_latent_input = torch.zeros_like(layers_latent_gt)
-                for b in range(B):
-                    n_valid = num_layers[b].item()
-                    # Random permutation of valid layers
-                    perm = torch.randperm(n_valid)
-                    shuffle_indices.append(perm)
-                    # Apply permutation
-                    layers_latent_input[b, :n_valid] = layers_latent_gt[b, perm]
-            else:
-                layers_latent_input = layers_latent_gt
-                shuffle_indices = [torch.arange(num_layers[b].item()) for b in range(B)]
-
-            # ========================================
-            # 4. Random layer masking
-            # ========================================
-            layer_mask = torch.zeros(B, N, device=accelerator.device)
-            original_masked_indices = []  # Store original (pre-shuffle) masked index
-            for b in range(B):
-                n_valid = num_layers[b].item()
-                # Never mask layer 0 (background) - always keep it as reference
-                # Sample from layers 1 to n_valid-1
-                if n_valid > 1:
-                    masked_idx = torch.randint(1, n_valid, (1,)).item()
-                else:
-                    # Edge case: only 1 layer (shouldn't happen with min_layers=2)
-                    masked_idx = 0
-                original_masked_indices.append(masked_idx)
-
-                # If shuffled, find where this layer ended up
-                if args.shuffle_layers:
-                    shuffled_idx = (shuffle_indices[b] == masked_idx).nonzero(as_tuple=True)[0].item()
-                    layer_mask[b, shuffled_idx] = 1
-                else:
-                    layer_mask[b, masked_idx] = 1
-
-            # ========================================
-            # 5. Forward pass
+            # 3. Forward pass (no shuffling, no mask)
             # ========================================
             optimizer.zero_grad()
 
-            merged_pred, layers_recon = model(layers_latent_input, layer_mask)
+            merged_pred, layers_recon = model(layers_latent_gt)
 
             # ========================================
-            # 6. Loss computation
+            # 4. Loss computation
             # ========================================
             # Loss 1: Merge loss (input projection)
-            # Predicted merged latent should match ground truth
             merge_loss = F.mse_loss(merged_pred, merged_latent_gt)
 
-            # Loss 2: Decompose loss (output projection)
-            # Reconstructed layers should match ORIGINAL (non-shuffled) ground truth
-            # Need to unshuffle the reconstruction for comparison
-            if args.shuffle_layers:
-                layers_recon_unshuffled = torch.zeros_like(layers_recon)
-                for b in range(B):
-                    n_valid = num_layers[b].item()
-                    # Inverse permutation
-                    inv_perm = torch.argsort(shuffle_indices[b])
-                    layers_recon_unshuffled[b, :n_valid] = layers_recon[b, inv_perm]
-            else:
-                layers_recon_unshuffled = layers_recon
-
-            # Compute per-layer loss
-            decompose_loss_per_layer = F.mse_loss(layers_recon_unshuffled, layers_latent_gt, reduction='none')
-            decompose_loss_per_layer = decompose_loss_per_layer.mean(dim=[2, 3, 4])  # (B, N)
-
-            # Create weighted mask
-            loss_weight_mask = torch.zeros(B, N, device=accelerator.device)
-            for b in range(B):
-                n_valid = num_layers[b].item()
-                for i in range(n_valid):
-                    # Base weight: 1.0
-                    weight = 1.0
-
-                    # Layer 0 (background): lower weight
-                    if i == 0:
-                        weight *= args.background_layer_weight
-
-                    # Masked layer: higher weight
-                    if i == original_masked_indices[b]:
-                        weight *= args.masked_layer_weight
-
-                    loss_weight_mask[b, i] = weight
-
-            # Weighted decompose loss
-            weighted_decompose_loss = (decompose_loss_per_layer * loss_weight_mask).sum() / loss_weight_mask.sum()
+            # Loss 2: Decompose loss with optimal assignment
+            decompose_loss, assignments = optimal_assignment_loss(
+                layers_recon,
+                layers_latent_gt,
+                num_layers,
+                background_weight=args.background_weight
+            )
 
             # Total loss
-            total_loss = args.merge_weight * merge_loss + args.decompose_weight * weighted_decompose_loss
+            total_loss = args.merge_weight * merge_loss + args.decompose_weight * decompose_loss
 
             # Backward
             accelerator.backward(total_loss)
@@ -523,7 +516,7 @@ def train():
             # Logging
             total_loss_sum += total_loss.item()
             merge_loss_sum += merge_loss.item()
-            decompose_loss_sum += weighted_decompose_loss.item()
+            decompose_loss_sum += decompose_loss.item()
             count += 1
 
             if (step + 1) % 50 == 0:
