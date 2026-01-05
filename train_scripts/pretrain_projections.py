@@ -600,21 +600,25 @@ def train():
             decompose_loss_sum += decompose_loss.item()
             count += 1
 
-            # Update progress bar with metrics
+            # Calculate running average
+            avg_total = total_loss_sum / count
+            avg_merge = merge_loss_sum / count
+            avg_decompose = decompose_loss_sum / count
+
+            # Update progress bar with both current and average
             pbar.set_postfix({
                 'loss': f'{total_loss.item():.4f}',
-                'perm': f'{metrics["permutation_rate"]:.2f}'  # How much assignment changes
+                'loss_avg': f'{avg_total:.4f}',
+                'perm': f'{metrics["permutation_rate"]:.2f}'
             })
 
             if (step + 1) % 50 == 0:
-                avg_total = total_loss_sum / count
-                avg_merge = merge_loss_sum / count
-                avg_decompose = decompose_loss_sum / count
-
                 logger.info(
                     f"Epoch [{epoch+1}/{args.epochs}] Step [{step+1}/{len(train_dataloader)}] "
-                    f"Loss: {avg_total:.4f} (merge: {avg_merge:.4f}, decomp: {avg_decompose:.4f}) "
-                    f"Permutation: {metrics['permutation_rate']:.2%}"
+                    f"Loss: {total_loss.item():.4f} (avg: {avg_total:.4f}) "
+                    f"Merge: {merge_loss.item():.4f} (avg: {avg_merge:.4f}) "
+                    f"Decomp: {decompose_loss.item():.4f} (avg: {avg_decompose:.4f}) "
+                    f"Perm: {metrics['permutation_rate']:.2%}"
                 )
 
                 total_loss_sum = 0
