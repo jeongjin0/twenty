@@ -65,7 +65,7 @@ def alpha_blend_layers(layers, num_layers):
     return merged
 
 
-def optimal_assignment_loss(pred_layers, gt_layers, num_valid, background_weight=0.5):
+def optimal_assignment_loss(pred_layers, gt_layers, num_valid, background_weight=0.1, target_layer_weight=2.0, target_indices=None):
     """
     Compute loss using optimal assignment (Hungarian algorithm)
 
@@ -73,17 +73,24 @@ def optimal_assignment_loss(pred_layers, gt_layers, num_valid, background_weight
         pred_layers: (B, N, C, H, W) - predicted layers (any order)
         gt_layers: (B, N, C, H, W) - ground truth layers (canonical order)
         num_valid: (B,) - number of valid layers per sample
-        background_weight: weight for layer 0 (background)
+        background_weight: weight for layer 0 (background, default=0.1)
+        target_layer_weight: extra weight for target layer (default=2.0)
+        target_indices: (B,) - which layer to prioritize (None = no priority)
 
     Returns:
         total_loss: scalar loss
         assignments: list of (pred_idx, gt_idx) tuples for each batch
+        metrics: dict with assignment statistics
     """
     B, N, C, H, W = pred_layers.shape
     device = pred_layers.device
 
     total_loss = 0.0
     all_assignments = []
+
+    # Metrics
+    total_permutations = 0
+    total_valid_layers = 0
 
     for b in range(B):
         n_valid = num_valid[b].item()
@@ -115,16 +122,40 @@ def optimal_assignment_loss(pred_layers, gt_layers, num_valid, background_weight
 
         all_assignments.append((pred_idx, gt_idx))
 
+        # Count permutations (how many layers NOT in canonical position)
+        permutation_count = 0
+        for p, g in zip(pred_idx, gt_idx):
+            if g < n_valid and p != g:  # Not in canonical position
+                permutation_count += 1
+        total_permutations += permutation_count
+        total_valid_layers += n_valid
+
         # Compute loss with gradients using the assignment
         for i, j in zip(pred_idx, gt_idx):
             if j < n_valid:  # Valid layer
                 layer_loss = F.mse_loss(pred_layers[b, i], gt_layers[b, j])
 
-                # Apply weight for background (layer 0)
-                weight = background_weight if j == 0 else 1.0
+                # Determine weight
+                weight = 1.0
+
+                # Background (layer 0): lower weight
+                if j == 0:
+                    weight = background_weight
+                # Target layer: higher weight
+                elif target_indices is not None and j == target_indices[b].item():
+                    weight = target_layer_weight
+
                 total_loss += weight * layer_loss
 
-    return total_loss / B, all_assignments
+    # Metrics
+    avg_permutation_rate = total_permutations / max(total_valid_layers, 1)
+    metrics = {
+        'permutation_rate': avg_permutation_rate,  # 0.0 = all canonical, 1.0 = all permuted
+        'total_permutations': total_permutations,
+        'total_valid_layers': total_valid_layers
+    }
+
+    return total_loss / B, all_assignments, metrics
 
 
 class ProjectionAutoencoder(nn.Module):
@@ -249,11 +280,13 @@ def visualize_predictions(model, dataloader, vae, epoch, output_dir, num_samples
         # ========================================
         # 4. Compute optimal assignment for visualization
         # ========================================
-        _, assignments = optimal_assignment_loss(
+        _, assignments, _ = optimal_assignment_loss(
             layers_recon,
             layers_latent_gt,
             num_layers,
-            background_weight=0.5
+            background_weight=0.1,
+            target_layer_weight=1.0,
+            target_indices=None
         )
 
         # ========================================
@@ -369,7 +402,9 @@ def train():
     parser.add_argument('--batch_size', type=int, default=4)
     parser.add_argument('--merge_weight', type=float, default=1.0, help='Weight for merge loss')
     parser.add_argument('--decompose_weight', type=float, default=1.0, help='Weight for decompose loss')
-    parser.add_argument('--background_weight', type=float, default=0.5, help='Weight for layer 0 (background)')
+    parser.add_argument('--background_weight', type=float, default=0.1, help='Weight for layer 0 (background)')
+    parser.add_argument('--target_layer_weight', type=float, default=2.0, help='Weight for target foreground layer')
+    parser.add_argument('--enable_shuffle', action='store_true', help='Shuffle input layer order for robustness')
     args = parser.parse_args()
 
     config = read_config(args.config)
@@ -484,24 +519,58 @@ def train():
                 layers_latent_gt = z_flat.reshape(B, N, 4, h, w)
 
             # ========================================
-            # 3. Forward pass (no shuffling, no mask)
+            # 3. Input shuffling (optional) + Target layer selection
+            # ========================================
+            shuffle_indices = []
+            target_indices = torch.zeros(B, dtype=torch.long, device=accelerator.device)
+
+            if args.enable_shuffle:
+                # Shuffle input layer order for order-invariance
+                layers_latent_input = torch.zeros_like(layers_latent_gt)
+                for b in range(B):
+                    n_valid = num_layers[b].item()
+                    # Random permutation of valid layers
+                    perm = torch.randperm(n_valid, device=accelerator.device)
+                    shuffle_indices.append(perm)
+                    layers_latent_input[b, :n_valid] = layers_latent_gt[b, perm]
+                    # Padding stays as is
+                    if n_valid < N:
+                        layers_latent_input[b, n_valid:] = layers_latent_gt[b, n_valid:]
+            else:
+                layers_latent_input = layers_latent_gt
+                shuffle_indices = [torch.arange(num_layers[b].item(), device=accelerator.device) for b in range(B)]
+
+            # Select target layer (foreground only, not background)
+            for b in range(B):
+                n_valid = num_layers[b].item()
+                if n_valid > 1:
+                    # Sample from layers 1 to n_valid-1 (not layer 0)
+                    target_indices[b] = torch.randint(1, n_valid, (1,), device=accelerator.device).item()
+                else:
+                    # Edge case: only one layer (shouldn't happen with min_layers=2)
+                    target_indices[b] = 0
+
+            # ========================================
+            # 4. Forward pass
             # ========================================
             optimizer.zero_grad()
 
-            merged_pred, layers_recon = model(layers_latent_gt)
+            merged_pred, layers_recon = model(layers_latent_input)
 
             # ========================================
-            # 4. Loss computation
+            # 5. Loss computation
             # ========================================
             # Loss 1: Merge loss (input projection)
             merge_loss = F.mse_loss(merged_pred, merged_latent_gt)
 
             # Loss 2: Decompose loss with optimal assignment
-            decompose_loss, assignments = optimal_assignment_loss(
+            decompose_loss, assignments, metrics = optimal_assignment_loss(
                 layers_recon,
                 layers_latent_gt,
                 num_layers,
-                background_weight=args.background_weight
+                background_weight=args.background_weight,
+                target_layer_weight=args.target_layer_weight,
+                target_indices=target_indices
             )
 
             # Total loss
@@ -519,16 +588,22 @@ def train():
             decompose_loss_sum += decompose_loss.item()
             count += 1
 
+            # Update progress bar with metrics
+            pbar.set_postfix({
+                'loss': f'{total_loss.item():.4f}',
+                'perm': f'{metrics["permutation_rate"]:.2f}'  # How much assignment changes
+            })
+
             if (step + 1) % 50 == 0:
                 avg_total = total_loss_sum / count
                 avg_merge = merge_loss_sum / count
                 avg_decompose = decompose_loss_sum / count
 
-                pbar.set_postfix({
-                    'total': f'{avg_total:.4f}',
-                    'merge': f'{avg_merge:.4f}',
-                    'decomp': f'{avg_decompose:.4f}'
-                })
+                logger.info(
+                    f"Epoch [{epoch+1}/{args.epochs}] Step [{step+1}/{len(train_dataloader)}] "
+                    f"Loss: {avg_total:.4f} (merge: {avg_merge:.4f}, decomp: {avg_decompose:.4f}) "
+                    f"Permutation: {metrics['permutation_rate']:.2%}"
+                )
 
                 total_loss_sum = 0
                 merge_loss_sum = 0
