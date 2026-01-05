@@ -131,22 +131,49 @@ def train():
         else:
             proj_state_dict = pretrained_proj
 
-        # Load only projection weights
+        # Handle key mapping from PretrainProjectionModel to PixArtLayerInpainting
+        # PretrainProjectionModel has: autoencoder.enc_conv1.weight, etc.
+        # PixArtLayerInpainting has: input_proj.enc_conv1.weight, output_proj.enc_conv1.weight, etc.
         model_dict = model.state_dict()
         proj_dict = {}
 
+        # Output projection: Load directly (4 → 24, fully compatible)
         for k, v in proj_state_dict.items():
-            if 'input_proj' in k or 'output_proj' in k:
-                proj_dict[k] = v
+            if k.startswith('autoencoder.dec_'):
+                # Map to output_proj
+                new_key = k.replace('autoencoder.', 'output_proj.')
+                if new_key in model_dict and model_dict[new_key].shape == v.shape:
+                    proj_dict[new_key] = v
+
+        # Input projection: Load encoder layers (except first conv which has different input channels)
+        for k, v in proj_state_dict.items():
+            if k.startswith('autoencoder.enc_'):
+                # Map to input_proj
+                new_key = k.replace('autoencoder.', 'input_proj.')
+
+                # First conv layer: pretrained has 24 input channels, model has 30 (24 + 6 mask)
+                if 'enc_conv1.weight' in k:
+                    # Initialize with pretrained weights for first 24 channels, random for last 6
+                    if new_key in model_dict:
+                        logger.info(f"  Partially loading {new_key}: pretrained 24 → model 30 channels")
+                        new_weight = model_dict[new_key].clone()
+                        # Copy pretrained weights to first 24 channels
+                        new_weight[:, :24, :, :] = v
+                        # Last 6 channels stay random initialized
+                        proj_dict[new_key] = new_weight
+                elif new_key in model_dict and model_dict[new_key].shape == v.shape:
+                    # Other encoder layers: load directly if shapes match
+                    proj_dict[new_key] = v
 
         logger.info(f"Loading {len(proj_dict)} projection parameters")
 
         model_dict.update(proj_dict)
         model.load_state_dict(model_dict)
 
-        logger.info("✓ Pretrained projections loaded successfully")
-        logger.info("  - Input projection: 6 layers → merged image latent")
-        logger.info("  - Output projection: merged image latent → 6 layers")
+        logger.info("✓ Pretrained projections loaded successfully (UNet-style with skip connections)")
+        logger.info("  - Input projection: 6 layers + mask → merged latent (4 channels)")
+        logger.info("  - Output projection: merged latent → 6 layers")
+        logger.info("  - Note: Input encoder first 24 channels from pretrained, last 6 random init")
 
     # ============================================
     # Build Dataset & Dataloader

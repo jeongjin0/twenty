@@ -1,11 +1,16 @@
 """
 Layer-wise Inpainting Model
 Channel concatenation approach with pretrained PixArt backbone
+
+Uses UNet-style projections with skip connections:
+- Input Projection: layers + mask → merged latent (4 channels)
+- Output Projection: merged latent → layers (per-layer noise prediction)
 """
 
 import torch
 import torch.nn as nn
 from diffusion.model.nets.PixArt import PixArt_XL_2
+from diffusion.model.nets.projection_unet import ProjectionAutoencoder
 
 
 class PixArtLayerInpainting(nn.Module):
@@ -36,19 +41,11 @@ class PixArtLayerInpainting(nn.Module):
         # Input: max_layers * 4 (latents) + max_layers (mask)
         input_channels = max_layers * 4 + max_layers  # 6*4 + 6 = 30
 
-        # Multi-layer Input Projection: 30 → 4 channels
-        # Uses spatial context (3×3 conv) and non-linearity for better layer blending
-        self.input_proj = nn.Sequential(
-            # Layer 1: Expand to intermediate channels
-            nn.Conv2d(input_channels, 64, kernel_size=3, padding=1),
-            nn.GroupNorm(8, 64),
-            nn.SiLU(),
-            # Layer 2: Process with non-linearity
-            nn.Conv2d(64, 32, kernel_size=3, padding=1),
-            nn.GroupNorm(8, 32),
-            nn.SiLU(),
-            # Layer 3: Project to 4 channels
-            nn.Conv2d(32, 4, kernel_size=1),
+        # UNet-style Input Projection: 30 → 4 channels
+        # Deep architecture with skip connections and residual blocks
+        self.input_proj = ProjectionAutoencoder(
+            in_channels=input_channels,  # 30
+            out_channels=4  # Merged latent space
         )
 
         # Pretrained PixArt backbone
@@ -65,20 +62,12 @@ class PixArtLayerInpainting(nn.Module):
                 pred_sigma=pred_sigma,
             )
 
-        # Multi-layer Output Projection: 4 → max_layers * 4
-        # Uses spatial context and non-linearity for better layer reconstruction
-        output_channels = max_layers * 4
-        self.output_proj = nn.Sequential(
-            # Layer 1: Expand from 4 channels
-            nn.Conv2d(4, 32, kernel_size=3, padding=1),
-            nn.GroupNorm(8, 32),
-            nn.SiLU(),
-            # Layer 2: Process with non-linearity
-            nn.Conv2d(32, 64, kernel_size=3, padding=1),
-            nn.GroupNorm(8, 64),
-            nn.SiLU(),
-            # Layer 3: Project to output channels
-            nn.Conv2d(64, output_channels, kernel_size=1),
+        # UNet-style Output Projection: 4 → max_layers * 4
+        # Deep architecture with skip connections and residual blocks
+        output_channels = max_layers * 4  # 24
+        self.output_proj = ProjectionAutoencoder(
+            in_channels=4,  # Merged latent space
+            out_channels=output_channels  # 24
         )
 
         # Store pred_sigma flag

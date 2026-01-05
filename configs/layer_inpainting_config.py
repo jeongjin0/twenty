@@ -27,7 +27,15 @@ gradient_checkpointing = True
 # Stage 1: Train projections only (pretrained PixArt frozen)
 # Stage 2: Train full model (PixArt unfrozen)
 pixart_freeze_epochs = 5  # Freeze PixArt for first 5 epochs
-pixart_unfreeze_lr_scale = 1 # Reduce LR by 50% when unfreezing (optional)
+pixart_unfreeze_lr_scale = 1.0  # Reduce LR when unfreezing (optional)
+
+# Loss Weights (Layer Hierarchy)
+# Masked layer: target layer to generate (highest priority)
+# Visible layers: reference layers (medium priority, prevent ignoring them)
+# Background: layer 0 within visible (lower priority)
+masked_layer_weight = 1.0       # Target (masked) layer
+visible_layer_weight = 0.5      # Reference (visible) layers
+background_layer_weight = 0.3   # Background (layer 0) scaling within visible
 
 # Optimizer
 optimizer = dict(
@@ -62,7 +70,7 @@ save_model_epochs = 5  # Save every 5 epochs
 save_model_steps = 5000  # Save every 5000 steps
 
 # Output
-work_dir = 'output/layer_inpainting_v3'
+work_dir = 'output/inpainting_v4'
 
 # Misc
 seed = 42

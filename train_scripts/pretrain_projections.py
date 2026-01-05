@@ -26,6 +26,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from diffusion.data.multilayer_builder import build_mulan_dataloader
 from diffusion.utils.logger import get_root_logger
 from diffusion.utils.misc import set_random_seed, read_config
+from diffusion.model.nets.projection_unet import ProjectionAutoencoder
 from accelerate import Accelerator
 from torchvision.utils import save_image
 import matplotlib.pyplot as plt
@@ -158,75 +159,14 @@ def optimal_assignment_loss(pred_layers, gt_layers, num_valid, background_weight
     return total_loss / B, all_assignments, metrics
 
 
-class ResidualBlock(nn.Module):
-    """Residual block with GroupNorm and SiLU"""
-
-    def __init__(self, channels):
-        super().__init__()
-        self.conv1 = nn.Conv2d(channels, channels, 3, padding=1)
-        self.norm1 = nn.GroupNorm(8, channels)
-        self.conv2 = nn.Conv2d(channels, channels, 3, padding=1)
-        self.norm2 = nn.GroupNorm(8, channels)
-
-    def forward(self, x):
-        residual = x
-        x = F.silu(self.norm1(self.conv1(x)))
-        x = self.norm2(self.conv2(x))
-        return F.silu(x + residual)
-
-
-class ProjectionAutoencoder(nn.Module):
+class PretrainProjectionModel(nn.Module):
     """
-    UNet-style Autoencoder with skip connections
-
-    Architecture:
-    - Encoder: 24 → 64 → 128 → 256 → 4 (with residual blocks)
-    - Decoder: 4 → 256 → 128 → 64 → 24 (with skip connections)
-    - 4-channel bottleneck preserved
-    - Much deeper with residual blocks
+    Wrapper for projection pretraining with merge/decompose strategy
     """
-
     def __init__(self, max_layers=6):
         super().__init__()
         self.max_layers = max_layers
-
-        # Encoder (Input Projection)
-        # Stage 1: 24 → 64
-        self.enc_conv1 = nn.Conv2d(24, 64, 3, padding=1)
-        self.enc_norm1 = nn.GroupNorm(8, 64)
-        self.enc_res1 = ResidualBlock(64)
-
-        # Stage 2: 64 → 128
-        self.enc_conv2 = nn.Conv2d(64, 128, 3, padding=1)
-        self.enc_norm2 = nn.GroupNorm(8, 128)
-        self.enc_res2 = ResidualBlock(128)
-
-        # Stage 3: 128 → 256
-        self.enc_conv3 = nn.Conv2d(128, 256, 3, padding=1)
-        self.enc_norm3 = nn.GroupNorm(8, 256)
-        self.enc_res3 = ResidualBlock(256)
-
-        # Bottleneck: 256 → 4
-        self.enc_final = nn.Conv2d(256, 4, 1)
-
-        # Decoder (Output Projection)
-        # Stage 1: 4 → 256
-        self.dec_conv1 = nn.Conv2d(4, 256, 1)
-        self.dec_norm1 = nn.GroupNorm(8, 256)
-        self.dec_res1 = ResidualBlock(256)
-
-        # Stage 2: 256 + 256 (skip) → 128
-        self.dec_conv2 = nn.Conv2d(512, 128, 3, padding=1)
-        self.dec_norm2 = nn.GroupNorm(8, 128)
-        self.dec_res2 = ResidualBlock(128)
-
-        # Stage 3: 128 + 128 (skip) → 64
-        self.dec_conv3 = nn.Conv2d(256, 64, 3, padding=1)
-        self.dec_norm3 = nn.GroupNorm(8, 64)
-        self.dec_res3 = ResidualBlock(64)
-
-        # Final: 64 + 64 (skip) → 24
-        self.dec_final = nn.Conv2d(128, 24, 3, padding=1)
+        self.autoencoder = ProjectionAutoencoder(in_channels=24, out_channels=24)
 
     def forward(self, layers):
         """
@@ -238,44 +178,14 @@ class ProjectionAutoencoder(nn.Module):
             layers_recon: (B, N, 4, h, w) - reconstructed layers
         """
         B, N, C, h, w = layers.shape
-        x = layers.reshape(B, N * C, h, w)  # (B, 24, h, w)
+        layers_flat = layers.reshape(B, N * C, h, w)  # (B, 24, h, w)
 
-        # Encoder with skip connections
-        # Stage 1
-        x = F.silu(self.enc_norm1(self.enc_conv1(x)))
-        skip1 = self.enc_res1(x)  # 64 channels
+        # Get bottleneck (merged latent)
+        merged, skips = self.autoencoder.encode(layers_flat)  # (B, 4, h, w)
 
-        # Stage 2
-        x = F.silu(self.enc_norm2(self.enc_conv2(skip1)))
-        skip2 = self.enc_res2(x)  # 128 channels
-
-        # Stage 3
-        x = F.silu(self.enc_norm3(self.enc_conv3(skip2)))
-        skip3 = self.enc_res3(x)  # 256 channels
-
-        # Bottleneck
-        merged = self.enc_final(skip3)  # 4 channels
-
-        # Decoder with skip connections
-        # Stage 1
-        x = F.silu(self.dec_norm1(self.dec_conv1(merged)))
-        x = self.dec_res1(x)
-
-        # Stage 2 (with skip3)
-        x = torch.cat([x, skip3], dim=1)  # 512 channels
-        x = F.silu(self.dec_norm2(self.dec_conv2(x)))
-        x = self.dec_res2(x)
-
-        # Stage 3 (with skip2)
-        x = torch.cat([x, skip2], dim=1)  # 256 channels
-        x = F.silu(self.dec_norm3(self.dec_conv3(x)))
-        x = self.dec_res3(x)
-
-        # Final (with skip1)
-        x = torch.cat([x, skip1], dim=1)  # 128 channels
-        x = self.dec_final(x)  # 24 channels
-
-        layers_recon = x.reshape(B, N, C, h, w)
+        # Reconstruct layers
+        layers_recon_flat = self.autoencoder.decode(merged, skips)  # (B, 24, h, w)
+        layers_recon = layers_recon_flat.reshape(B, N, C, h, w)
 
         return merged, layers_recon
 
@@ -492,7 +402,7 @@ def train():
     logger.info("="*60)
 
     # Model
-    model = ProjectionAutoencoder(max_layers=config.max_layers)
+    model = PretrainProjectionModel(max_layers=config.max_layers)
     logger.info(f"Parameters: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M")
 
     # Dataset
