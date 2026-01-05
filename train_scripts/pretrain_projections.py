@@ -404,7 +404,7 @@ def train():
     parser.add_argument('--decompose_weight', type=float, default=1.0, help='Weight for decompose loss')
     parser.add_argument('--background_weight', type=float, default=0.1, help='Weight for layer 0 (background)')
     parser.add_argument('--target_layer_weight', type=float, default=2.0, help='Weight for target foreground layer')
-    parser.add_argument('--enable_shuffle', action='store_true', help='Shuffle input layer order for robustness')
+    parser.add_argument('--enable_shuffle', action='store_true', help='Shuffle non-target foreground layers (pos2+)')
     args = parser.parse_args()
 
     config = read_config(args.config)
@@ -519,36 +519,48 @@ def train():
                 layers_latent_gt = z_flat.reshape(B, N, 4, h, w)
 
             # ========================================
-            # 3. Input shuffling (optional) + Target layer selection
+            # 3. Structured input with fixed positions
             # ========================================
-            shuffle_indices = []
+            # Position 0: Background (layer 0) - always fixed
+            # Position 1: Target layer - always fixed (for high weight learning)
+            # Position 2+: Other foreground layers - shuffled (optional)
+
             target_indices = torch.zeros(B, dtype=torch.long, device=accelerator.device)
+            layers_latent_input = torch.zeros_like(layers_latent_gt)
 
-            if args.enable_shuffle:
-                # Shuffle input layer order for order-invariance
-                layers_latent_input = torch.zeros_like(layers_latent_gt)
-                for b in range(B):
-                    n_valid = num_layers[b].item()
-                    # Random permutation of valid layers
-                    perm = torch.randperm(n_valid, device=accelerator.device)
-                    shuffle_indices.append(perm)
-                    layers_latent_input[b, :n_valid] = layers_latent_gt[b, perm]
-                    # Padding stays as is
-                    if n_valid < N:
-                        layers_latent_input[b, n_valid:] = layers_latent_gt[b, n_valid:]
-            else:
-                layers_latent_input = layers_latent_gt
-                shuffle_indices = [torch.arange(num_layers[b].item(), device=accelerator.device) for b in range(B)]
-
-            # Select target layer (foreground only, not background)
             for b in range(B):
                 n_valid = num_layers[b].item()
+
+                # Position 0: Always background (layer 0)
+                layers_latent_input[b, 0] = layers_latent_gt[b, 0]
+
                 if n_valid > 1:
-                    # Sample from layers 1 to n_valid-1 (not layer 0)
-                    target_indices[b] = torch.randint(1, n_valid, (1,), device=accelerator.device).item()
-                else:
-                    # Edge case: only one layer (shouldn't happen with min_layers=2)
-                    target_indices[b] = 0
+                    # Select target from foreground layers (1 to n_valid-1)
+                    target_idx = torch.randint(1, n_valid, (1,), device=accelerator.device).item()
+                    target_indices[b] = target_idx
+
+                    # Position 1: Always target layer
+                    layers_latent_input[b, 1] = layers_latent_gt[b, target_idx]
+
+                    # Remaining foreground layers (exclude background and target)
+                    remaining_indices = [i for i in range(1, n_valid) if i != target_idx]
+
+                    if len(remaining_indices) > 0:
+                        if args.enable_shuffle:
+                            # Shuffle remaining layers
+                            perm = torch.randperm(len(remaining_indices), device=accelerator.device)
+                            shuffled_indices = [remaining_indices[p] for p in perm]
+                        else:
+                            # Keep order
+                            shuffled_indices = remaining_indices
+
+                        # Fill positions 2, 3, 4, ... with remaining layers
+                        for new_pos, old_idx in enumerate(shuffled_indices):
+                            layers_latent_input[b, 2 + new_pos] = layers_latent_gt[b, old_idx]
+
+                # Padding stays as is
+                if n_valid < N:
+                    layers_latent_input[b, n_valid:] = layers_latent_gt[b, n_valid:]
 
             # ========================================
             # 4. Forward pass
