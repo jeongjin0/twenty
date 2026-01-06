@@ -37,20 +37,8 @@ def ddim_sample(
     """
     DDIM sampling for layer inpainting
 
-    Args:
-        model: PixArtLayerInpainting
-        clean_layers: (1, N, 4, h, w) - clean latents (visible layers)
-        layer_mask: (1, N) - binary mask (1 for masked layer)
-        prompt: Text prompt for masked layer
-        text_encoder: T5Embedder
-        diffusion: IDDPM
-        alphas_cumprod: Alpha schedule
-        cfg_scale: CFG scale
-        steps: DDIM steps
-        device: Device
-
-    Returns:
-        x_t: Final latent with generated masked layer
+    CRITICAL: Training used zero-noise prediction for visible layers!
+    Must replicate this behavior during inference.
     """
     B, N, C, h, w = clean_layers.shape
 
@@ -68,6 +56,9 @@ def ddim_sample(
     masked_idx = torch.where(layer_mask[0] == 1)[0][0].item()
     x_t[0, masked_idx] = torch.randn(C, h, w, device=device)
 
+    print(f"\n  Masked layer: {masked_idx}")
+    print(f"  Initial noise mean: {x_t[0, masked_idx].mean().item():.4f}, std: {x_t[0, masked_idx].std().item():.4f}")
+
     # Sampling loop
     for i in tqdm(range(steps), desc="Sampling", leave=False):
         t = timesteps[i].item()
@@ -75,33 +66,28 @@ def ddim_sample(
 
         t_batch = torch.full((B,), t, device=device, dtype=torch.long)
 
-        # CFG
-        if cfg_scale != 1.0:
-            x_in = torch.cat([x_t, x_t], dim=0)
-            t_in = torch.cat([t_batch, t_batch], dim=0)
-            mask_in = torch.cat([layer_mask, layer_mask], dim=0)
+        # No CFG (model not trained with unconditional)
+        noise_pred = model(x_t, layer_mask, t_batch, y, mask=y_mask)
 
-            # Null embedding
-            null_y = model.y_embedder.y_embedding.unsqueeze(0).unsqueeze(0)
-            null_y = null_y.to(y.device).to(y.dtype)
-            y_in = torch.cat([y, null_y], dim=0)
+        # CRITICAL FIX: Model predicts zero noise for visible layers during training
+        # So we should zero out noise_pred for visible layers
+        layer_mask_expanded = layer_mask.view(B, N, 1, 1, 1)
+        # Keep noise_pred only for masked layer, zero for visible
+        noise_pred = noise_pred * layer_mask_expanded
 
-            null_mask = torch.ones(B, y_mask.shape[1], device=device, dtype=y_mask.dtype)
-            y_mask_in = torch.cat([y_mask, null_mask], dim=0)
+        # Debug first step
+        if i == 0:
+            print(f"  Step 0 noise_pred stats:")
+            print(f"    Masked layer: mean={noise_pred[0, masked_idx].mean().item():.4f}, std={noise_pred[0, masked_idx].std().item():.4f}")
+            for j in range(N):
+                if layer_mask[0, j] == 0:
+                    print(f"    Visible layer {j}: mean={noise_pred[0, j].mean().item():.6f}, std={noise_pred[0, j].std().item():.6f}")
 
-            # Predict
-            noise_pred = model(x_in, mask_in, t_in, y_in, mask=y_mask_in)
-            noise_pred_cond, noise_pred_uncond = noise_pred.chunk(2, dim=0)
-            noise_pred = noise_pred_uncond + cfg_scale * (noise_pred_cond - noise_pred_uncond)
-        else:
-            # No CFG
-            noise_pred = model(x_t, layer_mask, t_batch, y, mask=y_mask)
-
-        # DDIM update
+        # DDIM update (only affects masked layer now)
         alpha_t = alphas_cumprod[t]
         alpha_next = alphas_cumprod[t_next] if t_next >= 0 else torch.tensor(1.0, device=device)
 
-        # Predict x0
+        # Predict x0 (only for masked layer due to noise_pred zeroing)
         x0_pred = (x_t - torch.sqrt(1 - alpha_t) * noise_pred) / torch.sqrt(alpha_t)
         x0_pred = torch.clamp(x0_pred, -3.0, 3.0)
 
@@ -110,8 +96,13 @@ def ddim_sample(
         x_next = torch.sqrt(alpha_next) * x0_pred + dir_xt
 
         # Keep visible layers clean (only update masked layer)
-        layer_mask_expanded = layer_mask.view(B, N, 1, 1, 1)
         x_t = x_next * layer_mask_expanded + clean_layers * (1 - layer_mask_expanded)
+
+        # Debug middle step
+        if i == steps // 2:
+            print(f"  Step {i} x_t[masked] stats: mean={x_t[0, masked_idx].mean().item():.4f}, std={x_t[0, masked_idx].std().item():.4f}")
+
+    print(f"  Final x_t[masked] stats: mean={x_t[0, masked_idx].mean().item():.4f}, std={x_t[0, masked_idx].std().item():.4f}")
 
     return x_t
 
@@ -324,7 +315,9 @@ def main():
     ).to(device).eval()
 
     # Load checkpoint
+    print(f"  Loading from: {args.checkpoint}")
     ckpt = torch.load(args.checkpoint, map_location='cpu')
+
     if 'state_dict_ema' in ckpt:
         state_dict = ckpt['state_dict_ema']
         print(f"  ✓ Using EMA model")
@@ -334,13 +327,33 @@ def main():
     else:
         state_dict = ckpt
 
+    # Check what's in the checkpoint
+    proj_keys = [k for k in state_dict.keys() if 'proj' in k.lower()]
+    print(f"  Projection keys in checkpoint: {len(proj_keys)}")
+
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
-    print(f"  ✓ Model loaded")
+    print(f"  ✓ Model loaded: {len(state_dict)} keys")
 
     if missing:
         proj_missing = [k for k in missing if 'proj' in k.lower()]
         if proj_missing:
-            print(f"  ⚠️  WARNING: {len(proj_missing)} projection keys missing")
+            print(f"  ❌ ERROR: {len(proj_missing)} projection keys missing!")
+            print(f"     First few: {proj_missing[:5]}")
+            print(f"  This means projections are RANDOM - results will be garbage!")
+        else:
+            print(f"  ⚠️  {len(missing)} non-critical keys missing")
+
+    if unexpected:
+        print(f"  ℹ️  {len(unexpected)} unexpected keys")
+
+    # Sanity check: verify projection weights are not random
+    input_proj_weight = model.input_proj.enc_conv1.weight
+    print(f"\n  Projection sanity check:")
+    print(f"    input_proj.enc_conv1.weight: mean={input_proj_weight.mean().item():.6f}, std={input_proj_weight.std().item():.6f}")
+    if abs(input_proj_weight.mean().item()) < 0.001 and abs(input_proj_weight.std().item() - 0.02) < 0.01:
+        print(f"    ⚠️  Looks like random init! (mean~0, std~0.02)")
+    else:
+        print(f"    ✓ Looks pretrained")
 
     # Load VAE
     vae = AutoencoderKL.from_pretrained(args.vae_path).to(device).eval()
