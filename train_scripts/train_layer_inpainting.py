@@ -344,17 +344,20 @@ def train():
 
                 # Flatten: (B, N, 3, H, W) → (B*N, 3, H, W)
                 layers_flat = layers_rgb.reshape(B * N, 3, H, W)
+                del layers_rgb  # Free memory immediately
 
                 # VAE encode
                 scale_factor = getattr(config, 'scale_factor', 0.18215)
                 z_flat = vae.encode(layers_flat).latent_dist.mode() * scale_factor
+                del layers_flat  # Free memory immediately
                 # (B*N, 4, h, w)
 
                 # Reshape back: (B*N, 4, h, w) → (B, N, 4, h, w)
                 z_clean = z_flat.reshape(B, N, 4, h, w)
+                del z_flat  # Free memory immediately
 
-                # Memory optimization
-                torch.cuda.empty_cache()
+            # Free original input (no longer needed)
+            del layers
 
             # ========================================
             # Random layer masking (exactly 1 layer)
@@ -384,6 +387,7 @@ def train():
                 caption_embs, emb_masks = text_encoder.get_text_embeddings(masked_captions)
                 y = caption_embs.float()[:, None].to(accelerator.device)
                 y_mask = emb_masks.to(accelerator.device)
+                del caption_embs, emb_masks  # Free memory immediately
 
             # ========================================
             # Sample timesteps
@@ -397,7 +401,7 @@ def train():
             # Training step
             # ========================================
             with accelerator.accumulate(model):
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)  # More memory efficient than setting to 0
 
                 # Forward diffusion: add noise using q_sample
                 noise = torch.randn_like(z_clean)
@@ -410,11 +414,15 @@ def train():
                 timesteps_expanded = timesteps.unsqueeze(1).expand(B, N).reshape(B * N)
 
                 z_noisy_flat = diffusion.q_sample(z_clean_flat, timesteps_expanded, noise=noise_flat)
+                del z_clean_flat, noise_flat, timesteps_expanded  # Free memory
+
                 z_noisy = z_noisy_flat.reshape(B, N, C, h, w)
+                del z_noisy_flat  # Free memory
 
                 # Replace visible layers with clean latents
                 layer_mask_expanded = layer_mask.view(B, max_layers, 1, 1, 1)
                 z_input = z_noisy * layer_mask_expanded + z_clean * (1 - layer_mask_expanded)
+                del z_noisy, layer_mask_expanded  # Free memory
 
                 # Predict noise
                 noise_pred = model(
@@ -446,11 +454,14 @@ def train():
                 ).mean(dim=[2, 3, 4])  # (B, max_layers)
 
                 # Compute zero-noise loss for visible layers
+                # Reuse zero tensor instead of creating each time
+                zero_noise = torch.zeros_like(noise)
                 zero_noise_loss = F.mse_loss(
                     noise_pred,
-                    torch.zeros_like(noise),
+                    zero_noise,
                     reduction='none'
                 ).mean(dim=[2, 3, 4])  # (B, max_layers)
+                del zero_noise  # Free memory
 
                 # Create weighted loss mask
                 loss_weight_mask = torch.zeros(B, max_layers, device=accelerator.device)
@@ -495,6 +506,10 @@ def train():
                 masked_loss = (noise_loss * layer_mask).sum() / (layer_mask.sum() + 1e-8)
                 visible_mask = (1 - layer_mask) * valid_mask
                 visible_loss = (zero_noise_loss * visible_mask).sum() / (visible_mask.sum() + 1e-8)
+
+                # Free intermediate tensors before backward
+                del noise_loss, zero_noise_loss, combined_loss, loss_weight_mask
+                del valid_mask, visible_mask, noise_pred, z_input, z_clean, noise
 
                 # Backward
                 accelerator.backward(total_loss)
@@ -547,8 +562,8 @@ def train():
 
             global_step += 1
 
-            # Memory optimization: periodic cache cleanup every 10 steps
-            if (step + 1) % 10 == 0:
+            # Memory optimization: periodic cache cleanup every 5 steps
+            if (step + 1) % 5 == 0:
                 gc.collect()
                 torch.cuda.empty_cache()
 
