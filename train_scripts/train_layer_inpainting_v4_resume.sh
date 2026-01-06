@@ -16,8 +16,8 @@
 
 CONFIG="configs/layer_inpainting_config.py"
 OUTPUT_DIR="output/inpainting_v4"
-PRETRAINED_PIXART="path/to/pixart_checkpoint.pth"  # Update this path
-PRETRAINED_PROJECTIONS="output/projection_pretrain/checkpoints/epoch_10.pth"  # From projection pretraining
+PRETRAINED_PIXART="PixArt-alpha/PixArt-XL-2-256x256.pth"  # Update this path
+PRETRAINED_PROJECTIONS="output/projection_pretrain_v3/checkpoints/epoch_05.pth"  # From projection pretraining
 
 # Resume checkpoint (auto-detect latest or specify manually)
 RESUME_CHECKPOINT=""  # Leave empty to auto-detect latest checkpoint

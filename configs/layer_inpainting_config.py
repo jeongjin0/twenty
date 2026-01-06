@@ -26,7 +26,7 @@ gradient_checkpointing = True
 # 2-Stage Training: Freeze PixArt for first N epochs
 # Stage 1: Train projections only (pretrained PixArt frozen)
 # Stage 2: Train full model (PixArt unfrozen)
-pixart_freeze_epochs = 5  # Freeze PixArt for first 5 epochs
+pixart_freeze_epochs = 0  # Freeze PixArt for first 5 epochs
 pixart_unfreeze_lr_scale = 1.0  # Reduce LR when unfreezing (optional)
 
 # Loss Weights (Layer Hierarchy)

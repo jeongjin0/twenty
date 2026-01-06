@@ -5,10 +5,10 @@
 # Output Projection: merged image latent → 6 layers (decomposition)
 
 CONFIG="configs/layer_inpainting_config.py"
-OUTPUT_DIR="output/projection_pretrain"
+OUTPUT_DIR="output/projection_pretrain_v3"
 EPOCHS=10
 LR=1e-4
-BATCH_SIZE=4
+BATCH_SIZE=8
 MERGE_WEIGHT=1.0
 DECOMPOSE_WEIGHT=1.0
 BACKGROUND_WEIGHT=0.1  # Layer 0 (background) much lower weight
@@ -50,8 +50,8 @@ export NCCL_P2P_DISABLE=1
 accelerate launch \
     --num_processes=2 \
     --num_machines=1 \
-    --mixed_precision=fp16 \
     --multi_gpu \
+    --mixed_precision=fp16 \
     train_scripts/pretrain_projections.py \
     --config ${CONFIG} \
     --output_dir ${OUTPUT_DIR} \

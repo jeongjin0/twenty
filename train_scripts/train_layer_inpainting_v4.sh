@@ -5,13 +5,13 @@
 
 CONFIG="configs/layer_inpainting_config.py"
 OUTPUT_DIR="output/inpainting_v4"
-PRETRAINED_PIXART="path/to/pixart_checkpoint.pth"  # Update this path
-PRETRAINED_PROJECTIONS="output/projection_pretrain/checkpoints/epoch_10.pth"  # From projection pretraining
+PRETRAINED_PIXART="PixArt-alpha/PixArt-XL-2-256x256.pth"  # Update this path
+PRETRAINED_PROJECTIONS="output/projection_pretrain_v3/checkpoints/epoch_05.pth"  # From projection pretraining
 
 EPOCHS=50
 LR=1e-4
-BATCH_SIZE=2
-GRADIENT_ACCUMULATION=2
+BATCH_SIZE=4
+GRADIENT_ACCUMULATION=4
 
 # Weight configuration (loss weights for different layer types)
 MASKED_LAYER_WEIGHT=1.0      # Target (masked) layer: highest priority
@@ -19,7 +19,7 @@ VISIBLE_LAYER_WEIGHT=0.5     # Reference (visible) layers: medium priority
 BACKGROUND_LAYER_WEIGHT=0.3  # Background (layer 0): lower priority within visible
 
 # 2-Stage Training (optional): Train projections first, then unfreeze PixArt
-PIXART_FREEZE_EPOCHS=5  # Freeze PixArt for first N epochs (0 = disabled)
+PIXART_FREEZE_EPOCHS=0  # Freeze PixArt for first N epochs (0 = disabled)
 
 echo "============================================"
 echo "Layer-wise Inpainting v4 Training"
