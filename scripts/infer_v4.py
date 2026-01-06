@@ -83,15 +83,17 @@ def ddim_sample(
             avg_visible_noise = sum(visible_noise_norms) / len(visible_noise_norms) if visible_noise_norms else 0
             print(f"    Average visible layer |noise|: {avg_visible_noise:.4f}")
             if avg_visible_noise > 0.1:
-                print(f"    ⚠️  WARNING: Model predicts HIGH noise for visible layers!")
-                print(f"    This means model is NOT using reference layers properly!")
-                print(f"    Training visible_layer_loss might not have worked.")
+                print(f"    ⚠️  Model predicts high noise for visible layers at t={t}")
+                print(f"    This is likely a timestep distribution mismatch issue")
 
-        # CRITICAL FIX: Model predicts zero noise for visible layers during training
-        # So we should zero out noise_pred for visible layers
-        layer_mask_expanded = layer_mask.view(B, N, 1, 1, 1)
-        # Keep noise_pred only for masked layer, zero for visible
-        noise_pred = noise_pred_raw * layer_mask_expanded
+        # CRITICAL: Use ONLY masked layer prediction, completely ignore visible layers
+        # Create noise_pred with zeros for all layers
+        noise_pred = torch.zeros_like(noise_pred_raw)
+        # Only copy masked layer prediction
+        for b in range(B):
+            for i_layer in range(N):
+                if layer_mask[b, i_layer] == 1:
+                    noise_pred[b, i_layer] = noise_pred_raw[b, i_layer]
 
         # Debug first step - show AFTER zeroing
         if i == 0:
