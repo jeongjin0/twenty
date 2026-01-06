@@ -67,21 +67,37 @@ def ddim_sample(
         t_batch = torch.full((B,), t, device=device, dtype=torch.long)
 
         # No CFG (model not trained with unconditional)
-        noise_pred = model(x_t, layer_mask, t_batch, y, mask=y_mask)
+        noise_pred_raw = model(x_t, layer_mask, t_batch, y, mask=y_mask)
+
+        # Debug first step - CHECK WHAT MODEL ACTUALLY PREDICTS
+        if i == 0:
+            print(f"  Step 0 noise_pred_raw (BEFORE zeroing):")
+            print(f"    Masked layer {masked_idx}: mean={noise_pred_raw[0, masked_idx].mean().item():.4f}, std={noise_pred_raw[0, masked_idx].std().item():.4f}")
+            visible_noise_norms = []
+            for j in range(N):
+                if layer_mask[0, j] == 0 and j < 4:  # Only check first 4 layers
+                    norm = noise_pred_raw[0, j].abs().mean().item()
+                    visible_noise_norms.append(norm)
+                    print(f"    Visible layer {j}: mean={noise_pred_raw[0, j].mean().item():.4f}, abs_mean={norm:.4f}")
+
+            avg_visible_noise = sum(visible_noise_norms) / len(visible_noise_norms) if visible_noise_norms else 0
+            print(f"    Average visible layer |noise|: {avg_visible_noise:.4f}")
+            if avg_visible_noise > 0.1:
+                print(f"    ⚠️  WARNING: Model predicts HIGH noise for visible layers!")
+                print(f"    This means model is NOT using reference layers properly!")
+                print(f"    Training visible_layer_loss might not have worked.")
 
         # CRITICAL FIX: Model predicts zero noise for visible layers during training
         # So we should zero out noise_pred for visible layers
         layer_mask_expanded = layer_mask.view(B, N, 1, 1, 1)
         # Keep noise_pred only for masked layer, zero for visible
-        noise_pred = noise_pred * layer_mask_expanded
+        noise_pred = noise_pred_raw * layer_mask_expanded
 
-        # Debug first step
+        # Debug first step - show AFTER zeroing
         if i == 0:
-            print(f"  Step 0 noise_pred stats:")
-            print(f"    Masked layer: mean={noise_pred[0, masked_idx].mean().item():.4f}, std={noise_pred[0, masked_idx].std().item():.4f}")
-            for j in range(N):
-                if layer_mask[0, j] == 0:
-                    print(f"    Visible layer {j}: mean={noise_pred[0, j].mean().item():.6f}, std={noise_pred[0, j].std().item():.6f}")
+            print(f"  Step 0 noise_pred (AFTER zeroing - should all be 0 for visible):")
+            print(f"    Masked layer {masked_idx}: mean={noise_pred[0, masked_idx].mean().item():.4f}, std={noise_pred[0, masked_idx].std().item():.4f}")
+            print(f"    Visible layers: all forced to 0.0 (as trained)")
 
         # DDIM update (only affects masked layer now)
         alpha_t = alphas_cumprod[t]
