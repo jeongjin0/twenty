@@ -1,6 +1,6 @@
 """
-Simple Inference Script for Inpainting V4
-Generate a single layer from text prompt
+Inference V4 - Dataset-based Testing
+Load samples from MuLan dataset and test layer inpainting with reference layers
 """
 
 import argparse
@@ -9,8 +9,6 @@ import sys
 import torch
 import torch.nn.functional as F
 from torchvision.utils import save_image
-from torchvision import transforms
-from PIL import Image
 from diffusers.models import AutoencoderKL
 from tqdm import tqdm
 
@@ -20,119 +18,75 @@ from diffusion.model.nets.PixArt_layer_inpainting import PixArtLayerInpainting
 from diffusion.model.nets.PixArt import PixArt_XL_2
 from diffusion.model.t5 import T5Embedder
 from diffusion import IDDPM
-
-
-def load_image(path, size=256):
-    """Load and preprocess image to [-1, 1]"""
-    img = Image.open(path).convert('RGB')
-    transform = transforms.Compose([
-        transforms.Resize((size, size)),
-        transforms.ToTensor(),
-        transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
-    ])
-    return transform(img)
+from diffusion.data.multilayer_builder import build_mulan_dataloader
 
 
 @torch.no_grad()
 def ddim_sample(
     model,
-    vae,
-    diffusion,
+    clean_layers,
+    layer_mask,
     prompt,
     text_encoder,
-    visible_layers=None,
-    masked_idx=0,
-    max_layers=6,
+    diffusion,
+    alphas_cumprod,
     cfg_scale=1.0,
     steps=50,
-    image_size=256,
     device='cuda'
 ):
     """
-    Generate a layer using DDIM sampling
+    DDIM sampling for layer inpainting
 
     Args:
         model: PixArtLayerInpainting
-        vae: VAE model
-        diffusion: IDDPM
-        prompt: Text prompt for generation
+        clean_layers: (1, N, 4, h, w) - clean latents (visible layers)
+        layer_mask: (1, N) - binary mask (1 for masked layer)
+        prompt: Text prompt for masked layer
         text_encoder: T5Embedder
-        visible_layers: Optional list of visible layer images (PIL or tensor)
-        masked_idx: Index to generate (default 0)
-        max_layers: Max number of layers (default 6)
-        cfg_scale: Classifier-free guidance scale (use 1.0 for no CFG)
-        steps: Number of DDIM steps
-        image_size: Image size
+        diffusion: IDDPM
+        alphas_cumprod: Alpha schedule
+        cfg_scale: CFG scale
+        steps: DDIM steps
         device: Device
 
     Returns:
-        generated_img: Generated layer image (3, H, W) in [-1, 1]
+        x_t: Final latent with generated masked layer
     """
-    h, w = image_size // 8, image_size // 8
-
-    # Encode visible layers if provided
-    clean_layers = torch.zeros(1, max_layers, 4, h, w, device=device)
-    layer_mask = torch.zeros(1, max_layers, device=device)
-    layer_mask[0, masked_idx] = 1  # Mark which layer to generate
-
-    if visible_layers:
-        for i, layer_img in enumerate(visible_layers):
-            if i == masked_idx:
-                continue  # Skip masked position
-            if i >= max_layers:
-                break
-
-            # Convert to tensor if needed
-            if isinstance(layer_img, (str, Image.Image)):
-                if isinstance(layer_img, str):
-                    layer_img = Image.open(layer_img)
-                layer_img = load_image(layer_img, image_size)
-
-            # Encode to latent
-            layer_img_device = layer_img.unsqueeze(0).to(device)
-            z = vae.encode(layer_img_device).latent_dist.mode() * 0.18215
-            clean_layers[0, i] = z.squeeze(0)
+    B, N, C, h, w = clean_layers.shape
 
     # Encode text
     caption_embs, emb_masks = text_encoder.get_text_embeddings([prompt])
     y = caption_embs.float()[:, None].to(device)
     y_mask = emb_masks.to(device)
-
-    # Get alpha schedule
-    alphas_cumprod = torch.from_numpy(diffusion.alphas_cumprod).float().to(device)
+    del caption_embs, emb_masks
 
     # DDIM timesteps
     timesteps = torch.linspace(999, 0, steps + 1, dtype=torch.long, device=device)
 
-    # Initialize with noise at masked position
+    # Initialize: noise at masked position, clean at visible positions
     x_t = clean_layers.clone()
-    x_t[0, masked_idx] = torch.randn(4, h, w, device=device)
-
-    print(f"Starting generation...")
-    print(f"  Prompt: '{prompt}'")
-    print(f"  Masked index: {masked_idx}")
-    print(f"  CFG scale: {cfg_scale}")
-    print(f"  Steps: {steps}")
+    masked_idx = torch.where(layer_mask[0] == 1)[0][0].item()
+    x_t[0, masked_idx] = torch.randn(C, h, w, device=device)
 
     # Sampling loop
-    for i in tqdm(range(steps), desc="Sampling"):
+    for i in tqdm(range(steps), desc="Sampling", leave=False):
         t = timesteps[i].item()
         t_next = timesteps[i + 1].item()
 
-        t_batch = torch.full((1,), t, device=device, dtype=torch.long)
+        t_batch = torch.full((B,), t, device=device, dtype=torch.long)
 
-        # CFG: conditional + unconditional
+        # CFG
         if cfg_scale != 1.0:
             x_in = torch.cat([x_t, x_t], dim=0)
             t_in = torch.cat([t_batch, t_batch], dim=0)
             mask_in = torch.cat([layer_mask, layer_mask], dim=0)
 
-            # Get null embedding
+            # Null embedding
             null_y = model.y_embedder.y_embedding.unsqueeze(0).unsqueeze(0)
             null_y = null_y.to(y.device).to(y.dtype)
             y_in = torch.cat([y, null_y], dim=0)
 
-            null_mask = torch.ones(1, y_mask.shape[1], device=device, dtype=y_mask.dtype)
+            null_mask = torch.ones(B, y_mask.shape[1], device=device, dtype=y_mask.dtype)
             y_mask_in = torch.cat([y_mask, null_mask], dim=0)
 
             # Predict
@@ -143,7 +97,7 @@ def ddim_sample(
             # No CFG
             noise_pred = model(x_t, layer_mask, t_batch, y, mask=y_mask)
 
-        # DDIM update (only for masked layer)
+        # DDIM update
         alpha_t = alphas_cumprod[t]
         alpha_next = alphas_cumprod[t_next] if t_next >= 0 else torch.tensor(1.0, device=device)
 
@@ -151,57 +105,209 @@ def ddim_sample(
         x0_pred = (x_t - torch.sqrt(1 - alpha_t) * noise_pred) / torch.sqrt(alpha_t)
         x0_pred = torch.clamp(x0_pred, -3.0, 3.0)
 
-        # Compute x_next
+        # Next step
         dir_xt = torch.sqrt(1 - alpha_next) * noise_pred
         x_next = torch.sqrt(alpha_next) * x0_pred + dir_xt
 
-        # Keep visible layers clean
-        layer_mask_expanded = layer_mask.view(1, max_layers, 1, 1, 1)
+        # Keep visible layers clean (only update masked layer)
+        layer_mask_expanded = layer_mask.view(B, N, 1, 1, 1)
         x_t = x_next * layer_mask_expanded + clean_layers * (1 - layer_mask_expanded)
 
-    # Decode generated layer
-    z_generated = x_t[0, masked_idx:masked_idx+1] / 0.18215
-    img_generated = vae.decode(z_generated).sample[0]
+    return x_t
 
-    return img_generated
+
+@torch.no_grad()
+def run_inference(
+    model,
+    vae,
+    diffusion,
+    dataloader,
+    text_encoder,
+    output_dir,
+    num_samples=5,
+    max_layers=6,
+    cfg_scale=1.0,
+    steps=50,
+    device='cuda'
+):
+    """Run inference on dataset samples"""
+    os.makedirs(output_dir, exist_ok=True)
+
+    model.eval()
+
+    # Alpha schedule
+    alphas_cumprod = torch.from_numpy(diffusion.alphas_cumprod).float().to(device)
+
+    print("="*60)
+    print("Inpainting V4 - Dataset Inference")
+    print("="*60)
+    print(f"Samples: {num_samples}")
+    print(f"CFG Scale: {cfg_scale}")
+    print(f"Steps: {steps}")
+    print("="*60)
+
+    sample_count = 0
+    scale_factor = 0.18215
+
+    for batch_idx, batch in enumerate(dataloader):
+        if sample_count >= num_samples:
+            break
+
+        layers, captions, num_layers, image_ids = batch
+        layers = layers.to(device)
+        num_layers = num_layers.to(device)
+
+        B = layers.shape[0]
+        N = layers.shape[1]
+        H, W = layers.shape[3], layers.shape[4]
+        h, w = H // 8, W // 8
+
+        # Encode to VAE latent
+        layers_rgb = layers[:, :, :3, :, :]
+        layers_flat = layers_rgb.reshape(B * N, 3, H, W)
+        z_flat = vae.encode(layers_flat).latent_dist.mode() * scale_factor
+        z_clean = z_flat.reshape(B, N, 4, h, w)
+        del layers_rgb, layers_flat, z_flat
+
+        # Process each sample
+        for b in range(B):
+            if sample_count >= num_samples:
+                break
+
+            n_valid = num_layers[b].item()
+            image_id = image_ids[b]
+
+            # Test each layer as masked (except background for now)
+            for masked_idx in range(1, min(n_valid, 3)):  # Test first 2 foreground layers
+                if sample_count >= num_samples:
+                    break
+
+                print(f"\n[Sample {sample_count + 1}/{num_samples}]")
+                print(f"  Image ID: {image_id}")
+                print(f"  Valid layers: {n_valid}")
+                print(f"  Masked layer: {masked_idx}")
+
+                # Prepare inputs
+                layer_mask = torch.zeros(1, max_layers, device=device)
+                layer_mask[0, masked_idx] = 1
+
+                clean_layers = z_clean[b:b+1].clone()
+                prompt = captions[b][masked_idx]
+                print(f"  Prompt: '{prompt}'")
+
+                # Generate
+                x_t = ddim_sample(
+                    model=model,
+                    clean_layers=clean_layers,
+                    layer_mask=layer_mask,
+                    prompt=prompt,
+                    text_encoder=text_encoder,
+                    diffusion=diffusion,
+                    alphas_cumprod=alphas_cumprod,
+                    cfg_scale=cfg_scale,
+                    steps=steps,
+                    device=device
+                )
+
+                # Decode generated layer
+                z_generated = x_t[0, masked_idx:masked_idx+1] / scale_factor
+                img_generated = vae.decode(z_generated).sample[0]
+
+                # Decode ground truth
+                z_gt = z_clean[b, masked_idx:masked_idx+1] / scale_factor
+                img_gt = vae.decode(z_gt).sample[0]
+
+                # Decode all layers (for comparison)
+                all_imgs = []
+                all_imgs_gt = []
+                for i in range(n_valid):
+                    # Generated version
+                    z = x_t[0, i:i+1] / scale_factor
+                    img = vae.decode(z).sample[0]
+                    all_imgs.append(img)
+
+                    # Ground truth version
+                    z_gt_layer = z_clean[b, i:i+1] / scale_factor
+                    img_gt_layer = vae.decode(z_gt_layer).sample[0]
+                    all_imgs_gt.append(img_gt_layer)
+
+                # Save results
+                sample_dir = os.path.join(output_dir, f"sample_{sample_count:03d}_{image_id}_layer{masked_idx}")
+                os.makedirs(sample_dir, exist_ok=True)
+
+                # Generated masked layer
+                save_image(img_generated,
+                          os.path.join(sample_dir, 'generated.png'),
+                          normalize=True, value_range=(-1, 1))
+
+                # Ground truth masked layer
+                save_image(img_gt,
+                          os.path.join(sample_dir, 'ground_truth.png'),
+                          normalize=True, value_range=(-1, 1))
+
+                # Comparison: generated vs GT
+                comparison = torch.stack([img_generated, img_gt], dim=0)
+                save_image(comparison,
+                          os.path.join(sample_dir, 'comparison.png'),
+                          nrow=2, normalize=True, value_range=(-1, 1))
+
+                # All layers (with generated)
+                if all_imgs:
+                    all_imgs_tensor = torch.stack(all_imgs, dim=0)
+                    save_image(all_imgs_tensor,
+                              os.path.join(sample_dir, 'all_layers.png'),
+                              nrow=n_valid, normalize=True, value_range=(-1, 1))
+
+                # All layers (ground truth)
+                if all_imgs_gt:
+                    all_imgs_gt_tensor = torch.stack(all_imgs_gt, dim=0)
+                    save_image(all_imgs_gt_tensor,
+                              os.path.join(sample_dir, 'all_layers_gt.png'),
+                              nrow=n_valid, normalize=True, value_range=(-1, 1))
+
+                # Save info
+                with open(os.path.join(sample_dir, 'info.txt'), 'w') as f:
+                    f.write(f"Image ID: {image_id}\n")
+                    f.write(f"Masked layer: {masked_idx}/{n_valid-1}\n")
+                    f.write(f"Prompt: {prompt}\n")
+                    f.write(f"CFG scale: {cfg_scale}\n")
+                    f.write(f"Steps: {steps}\n")
+
+                print(f"  ✓ Saved to: {sample_dir}")
+                sample_count += 1
+
+    print("\n" + "="*60)
+    print(f"Inference complete! Processed {sample_count} samples")
+    print(f"Results: {output_dir}")
+    print("="*60)
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Inpainting V4 Inference')
-    parser.add_argument('--checkpoint', type=str, required=True, help='Model checkpoint path')
-    parser.add_argument('--prompt', type=str, required=True, help='Text prompt for generation')
-    parser.add_argument('--output', type=str, default='output.png', help='Output image path')
-
-    # Optional reference layers
-    parser.add_argument('--visible_layers', type=str, nargs='*', help='Optional visible layer images')
-    parser.add_argument('--masked_idx', type=int, default=0, help='Index to generate (default 0)')
-
-    # Generation parameters
-    parser.add_argument('--cfg_scale', type=float, default=1.0, help='CFG scale (default 1.0 = no CFG)')
+    parser = argparse.ArgumentParser(description='Inpainting V4 - Dataset Inference')
+    parser.add_argument('--checkpoint', type=str, required=True, help='Model checkpoint')
+    parser.add_argument('--data_roots', type=str, nargs='+', required=True, help='Dataset directories')
+    parser.add_argument('--output_dir', type=str, default='output/inference_v4', help='Output directory')
+    parser.add_argument('--num_samples', type=int, default=5, help='Number of samples')
+    parser.add_argument('--cfg_scale', type=float, default=1.0, help='CFG scale (1.0 recommended)')
     parser.add_argument('--steps', type=int, default=50, help='Sampling steps')
-    parser.add_argument('--image_size', type=int, default=256, help='Image size')
     parser.add_argument('--max_layers', type=int, default=6, help='Max layers')
-
-    # Model paths
+    parser.add_argument('--image_size', type=int, default=256, help='Image size')
     parser.add_argument('--vae_path', type=str, default='PixArt-alpha/sd-vae-ft-ema')
     parser.add_argument('--t5_path', type=str, default='PixArt-alpha')
-
     args = parser.parse_args()
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
     print("="*60)
-    print("Inpainting V4 - Simple Inference")
+    print("Inpainting V4 - Dataset-based Inference")
     print("="*60)
     print(f"Checkpoint: {args.checkpoint}")
-    print(f"Prompt: {args.prompt}")
-    print(f"Output: {args.output}")
+    print(f"Data: {args.data_roots}")
     print("="*60)
 
     # Load models
     print("\n[1/4] Loading models...")
 
-    # Create model
     pretrained_pixart = PixArt_XL_2(
         input_size=args.image_size // 8,
         in_channels=4,
@@ -218,10 +324,7 @@ def main():
     ).to(device).eval()
 
     # Load checkpoint
-    print(f"  Loading checkpoint...")
     ckpt = torch.load(args.checkpoint, map_location='cpu')
-
-    # Try EMA first
     if 'state_dict_ema' in ckpt:
         state_dict = ckpt['state_dict_ema']
         print(f"  ✓ Using EMA model")
@@ -237,8 +340,7 @@ def main():
     if missing:
         proj_missing = [k for k in missing if 'proj' in k.lower()]
         if proj_missing:
-            print(f"  ⚠️  WARNING: {len(proj_missing)} projection keys missing!")
-            print(f"      This may cause poor results.")
+            print(f"  ⚠️  WARNING: {len(proj_missing)} projection keys missing")
 
     # Load VAE
     vae = AutoencoderKL.from_pretrained(args.vae_path).to(device).eval()
@@ -257,42 +359,36 @@ def main():
     diffusion = IDDPM(str(1000))
     print(f"  ✓ Diffusion ready")
 
-    # Load visible layers if provided
-    print("\n[2/4] Preparing inputs...")
-    visible_layers = None
-    if args.visible_layers:
-        visible_layers = []
-        for path in args.visible_layers:
-            img = load_image(path, args.image_size)
-            visible_layers.append(img)
-            print(f"  ✓ Loaded: {path}")
+    # Load dataset
+    print("\n[2/4] Loading dataset...")
+    dataloader = build_mulan_dataloader(
+        data_roots=args.data_roots,
+        batch_size=1,
+        resolution=args.image_size,
+        max_layers=args.max_layers,
+        num_workers=0,
+        shuffle=False,
+        caption_type='blip2'
+    )
+    print(f"  ✓ Dataset: {len(dataloader)} images")
 
-    # Generate
-    print("\n[3/4] Generating...")
-    generated = ddim_sample(
+    # Run inference
+    print("\n[3/4] Running inference...")
+    run_inference(
         model=model,
         vae=vae,
         diffusion=diffusion,
-        prompt=args.prompt,
+        dataloader=dataloader,
         text_encoder=t5,
-        visible_layers=visible_layers,
-        masked_idx=args.masked_idx,
+        output_dir=args.output_dir,
+        num_samples=args.num_samples,
         max_layers=args.max_layers,
         cfg_scale=args.cfg_scale,
         steps=args.steps,
-        image_size=args.image_size,
         device=device
     )
 
-    # Save
-    print("\n[4/4] Saving...")
-    os.makedirs(os.path.dirname(args.output) or '.', exist_ok=True)
-    save_image(generated, args.output, normalize=True, value_range=(-1, 1))
-    print(f"  ✓ Saved: {args.output}")
-
-    print("\n" + "="*60)
-    print("Done!")
-    print("="*60)
+    print("\n[4/4] Done!")
 
 
 if __name__ == '__main__':
