@@ -42,6 +42,9 @@ def ddim_sample(
     """
     B, N, C, h, w = clean_layers.shape
 
+    # Expand layer mask for broadcasting
+    layer_mask_expanded = layer_mask[:, :, None, None, None].float()  # (B, N, 1, 1, 1)
+
     # Encode text
     caption_embs, emb_masks = text_encoder.get_text_embeddings([prompt])
     y = caption_embs.float()[:, None].to(device)
