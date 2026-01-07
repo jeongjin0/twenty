@@ -36,30 +36,34 @@ class SimpleDDIMSampler:
         self.alphas_cumprod = torch.cumprod(alphas, dim=0)
     
     @torch.no_grad()
-    def sample(self, model, shape, y, y_mask, x_ref, cfg_scale=4.5, steps=20, device='cuda'):
-        """DDIM Sampling with reference"""
+    def sample(self, model, shape, y, y_mask, x_ref, null_y, null_mask, cfg_scale=4.5, steps=20, device='cuda'):
+        """DDIM Sampling with reference
+
+        Args:
+            null_y: Unconditional embedding from T5("") - must match training!
+            null_mask: Attention mask for null_y
+        """
         self.alphas_cumprod = self.alphas_cumprod.to(device)
 
-        
+
         x = torch.randn(shape, device=device)
         timesteps = torch.linspace(self.num_timesteps - 1, 0, steps + 1, dtype=torch.long, device=device)
-        
+
         for i in tqdm(range(steps), desc="Sampling"):
             t = timesteps[i]
             t_next = timesteps[i + 1]
             t_batch = t.expand(shape[0])
-            
+
             # CFG
             x_in = torch.cat([x, x], dim=0)
             t_in = torch.cat([t_batch, t_batch], dim=0)
 
-            null_y = model.y_embedder.y_embedding.unsqueeze(0).unsqueeze(0)  # (1, 1, L, 4096)
-            null_y = null_y.to(y.device).to(y.dtype)
+            # Use T5("") embedding instead of model.y_embedder.y_embedding
+            # This matches training where empty string "" was encoded by T5
             y_in = torch.cat([y, null_y], dim=0)
 
             x_ref_in = torch.cat([x_ref, x_ref], dim=0)
-            
-            null_mask = torch.ones(1, y_mask.shape[1], device=y_mask.device, dtype=y_mask.dtype)
+
             mask_in = torch.cat([y_mask, null_mask], dim=0)
 
             # try:
@@ -203,6 +207,11 @@ def main():
     
     t5 = T5Embedder(device=device, local_cache=True, cache_dir=args.t5_path, torch_dtype=torch.float16)
     print(f"  ✓ T5 loaded")
+
+    # Pre-compute null embedding (T5("")) - must match training!
+    null_caption_embs, null_mask = t5.get_text_embeddings([""])
+    null_y = null_caption_embs.float()[:, None]  # (1, 1, L, 4096)
+    print(f"  ✓ Null embedding computed from T5(\"\")")
     
     # ============================================
     # Load Reference Images
@@ -279,13 +288,15 @@ def main():
         print("\n[5/5] Generating target layer...")
         
         sampler = SimpleDDIMSampler()
-        
+
         z = sampler.sample(
             model=model,
             shape=(1, 4, latent_size, latent_size),
             y=y,
             y_mask=mask,
             x_ref=ref_latents,
+            null_y=null_y,
+            null_mask=null_mask,
             cfg_scale=args.cfg_scale,
             steps=args.steps,
             device=device,
