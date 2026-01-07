@@ -89,21 +89,70 @@ def test_pretrained_projection(args):
     model = PretrainProjectionModel(max_layers=args.max_layers).to(device).eval()
 
     ckpt = torch.load(args.checkpoint, map_location='cpu')
+
+    # Debug: Check what's in the checkpoint
+    print(f"  Checkpoint keys: {list(ckpt.keys())}")
+
     state_dict = ckpt.get('state_dict', ckpt)
+
+    # Debug: Check state dict keys
+    print(f"  State dict keys (first 10): {list(state_dict.keys())[:10]}")
+    print(f"  Total keys in state_dict: {len(state_dict)}")
 
     # Load weights
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
     print(f"  ✓ Loaded from {args.checkpoint}")
     if missing:
         print(f"  ⚠ Missing keys: {len(missing)}")
+        for k in missing[:5]:
+            print(f"      {k}")
     if unexpected:
         print(f"  ⚠ Unexpected keys: {len(unexpected)}")
+        for k in unexpected[:5]:
+            print(f"      {k}")
 
     # Check weights
     enc_weight = model.autoencoder.enc_conv1.weight
     dec_weight = model.autoencoder.dec_conv1.weight
     print(f"\n  Encoder conv1: mean={enc_weight.mean():.6f}, std={enc_weight.std():.6f}")
     print(f"  Decoder conv1: mean={dec_weight.mean():.6f}, std={dec_weight.std():.6f}")
+
+    # Compare with random initialization
+    print(f"\n  Comparing with random initialization...")
+    random_model = PretrainProjectionModel(max_layers=args.max_layers).to(device)
+    rand_enc = random_model.autoencoder.enc_conv1.weight
+    rand_dec = random_model.autoencoder.dec_conv1.weight
+    print(f"  Random encoder conv1: mean={rand_enc.mean():.6f}, std={rand_enc.std():.6f}")
+    print(f"  Random decoder conv1: mean={rand_dec.mean():.6f}, std={rand_dec.std():.6f}")
+
+    # Check if weights are different from random
+    enc_diff = (enc_weight - rand_enc).abs().mean().item()
+    dec_diff = (dec_weight - rand_dec).abs().mean().item()
+    print(f"  Loaded vs Random diff (encoder): {enc_diff:.6f}")
+    print(f"  Loaded vs Random diff (decoder): {dec_diff:.6f}")
+
+    if enc_diff < 0.001 and dec_diff < 0.001:
+        print(f"\n  ⚠️  WARNING: Weights are very close to random initialization!")
+        print(f"      The checkpoint may not have been loaded correctly.")
+
+    # Quick test with random input
+    print(f"\n  Quick test with random input...")
+    test_input = torch.randn(1, 6, 4, 32, 32, device=device)
+    with torch.no_grad():
+        loaded_merged, loaded_recon = model(test_input)
+        random_merged, random_recon = random_model(test_input)
+
+    recon_error_loaded = F.mse_loss(loaded_recon, test_input).item()
+    recon_error_random = F.mse_loss(random_recon, test_input).item()
+    print(f"  Loaded model reconstruction MSE: {recon_error_loaded:.6f}")
+    print(f"  Random model reconstruction MSE: {recon_error_random:.6f}")
+
+    if recon_error_loaded > recon_error_random:
+        print(f"  ⚠️  Loaded model is WORSE than random! Something is wrong.")
+    elif recon_error_loaded < recon_error_random * 0.5:
+        print(f"  ✓ Loaded model is better than random (good sign)")
+    else:
+        print(f"  Similar to random - may need more training")
 
     # ========================================
     # Load VAE
@@ -168,7 +217,20 @@ def test_pretrained_projection(args):
         # ========================================
         merged_latent, layers_recon = model(z_layers)
 
-        print(f"    Merged latent: mean={merged_latent.mean():.4f}, std={merged_latent.std():.4f}")
+        # Debug: Check input/output statistics
+        print(f"\n    === Latent Statistics ===")
+        print(f"    Input layers: mean={z_layers.mean():.4f}, std={z_layers.std():.4f}")
+        print(f"    Input layers: min={z_layers.min():.4f}, max={z_layers.max():.4f}")
+        print(f"    Merged (bottleneck): mean={merged_latent.mean():.4f}, std={merged_latent.std():.4f}")
+        print(f"    Merged: min={merged_latent.min():.4f}, max={merged_latent.max():.4f}")
+        print(f"    Recon layers: mean={layers_recon.mean():.4f}, std={layers_recon.std():.4f}")
+        print(f"    Recon layers: min={layers_recon.min():.4f}, max={layers_recon.max():.4f}")
+
+        # Per-layer reconstruction error
+        print(f"\n    === Reconstruction Error (MSE) ===")
+        for i in range(n_valid):
+            mse = F.mse_loss(layers_recon[0, i], z_layers[0, i]).item()
+            print(f"    Layer {i}: MSE={mse:.6f}")
 
         # ========================================
         # 3. Compute optimal assignment
