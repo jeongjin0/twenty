@@ -62,6 +62,7 @@ class MuLanDataset(Dataset):
         # Transform
         self.transform = T.Compose([
             T.Resize((resolution, resolution), interpolation=T.InterpolationMode.BILINEAR),
+            T.RandomHorizontalFlip(p=0.5),
             T.ToTensor(),  # [0, 255] -> [0, 1]
             T.Normalize([0.5, 0.5, 0.5, 0.5], [0.5, 0.5, 0.5, 0.5]),  # [0, 1] -> [-1, 1] (RGBA 4채널)
         ])
