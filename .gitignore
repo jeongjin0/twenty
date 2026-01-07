@@ -1,0 +1,20 @@
+*pyc
+*pth
+nohup.out
+docker-readme.md
+docker-compose.yml
+docker-entrypoint.sh
+dockerfile
+output
+inferenece_results
+diffusion/*.pyc
+*.log
+*.sh
+*.png
+inference_results
+PixArt-alpha
+Dockerfile
+diffusion/model/nets/__pycache__/__init__.cpython-39.pyc
+# Python cache
+__pycache__/
+*.py[cod]
