@@ -109,8 +109,20 @@ def ddim_sample(
         alpha_next = alphas_cumprod[t_next] if t_next >= 0 else torch.tensor(1.0, device=device)
 
         # Predict x0 (only for masked layer due to noise_pred zeroing)
-        x0_pred = (x_t - torch.sqrt(1 - alpha_t) * noise_pred) / torch.sqrt(alpha_t)
-        x0_pred = torch.clamp(x0_pred, -3.0, 3.0)
+        x0_pred_raw = (x_t - torch.sqrt(1 - alpha_t) * noise_pred) / torch.sqrt(alpha_t)
+
+        # Debug: Check if clamp is causing information loss
+        if i == 0:
+            x0_masked = x0_pred_raw[0, masked_idx]
+            clipped_ratio = ((x0_masked.abs() > 3.0).float().mean() * 100).item()
+            print(f"  Step 0 x0_pred (BEFORE clamp):")
+            print(f"    Masked layer: mean={x0_masked.mean().item():.4f}, std={x0_masked.std().item():.4f}")
+            print(f"    min={x0_masked.min().item():.4f}, max={x0_masked.max().item():.4f}")
+            print(f"    Clipped ratio: {clipped_ratio:.1f}%")
+            if clipped_ratio > 10:
+                print(f"    ⚠️  HIGH CLIPPING! This may cause texture artifacts")
+
+        x0_pred = torch.clamp(x0_pred_raw, -3.0, 3.0)
 
         # Next step
         dir_xt = torch.sqrt(1 - alpha_next) * noise_pred
