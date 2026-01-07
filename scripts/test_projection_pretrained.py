@@ -99,6 +99,14 @@ def test_pretrained_projection(args):
     print(f"  State dict keys (first 10): {list(state_dict.keys())[:10]}")
     print(f"  Total keys in state_dict: {len(state_dict)}")
 
+    # Fix key mapping: checkpoint has "enc_conv1" but model expects "autoencoder.enc_conv1"
+    # Check if keys need prefix
+    first_key = list(state_dict.keys())[0]
+    if not first_key.startswith('autoencoder.'):
+        print(f"  Fixing key mapping: adding 'autoencoder.' prefix")
+        state_dict = {f'autoencoder.{k}': v for k, v in state_dict.items()}
+        print(f"  Fixed keys (first 3): {list(state_dict.keys())[:3]}")
+
     # Load weights
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
     print(f"  ✓ Loaded from {args.checkpoint}")
