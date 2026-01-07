@@ -6,7 +6,7 @@
 # ============================================
 # Configuration
 # ============================================
-CHECKPOINT="output/inpainting_v4/checkpoints/epoch_50.pth"
+CHECKPOINT="output/inpainting_v4/checkpoints/epoch_10_step_50000.pth"
 DATA_ROOTS="../data/mulan_coco ../data/mulan_laion"
 OUTPUT_DIR="output/inference_v4"
 

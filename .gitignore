@@ -15,3 +15,6 @@ inference_results
 PixArt-alpha
 Dockerfile
 diffusion/model/nets/__pycache__/__init__.cpython-39.pyc
+# Python cache
+__pycache__/
+*.py[cod]
