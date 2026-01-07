@@ -56,9 +56,30 @@ def test_projection(args):
 
     # Load checkpoint
     ckpt = torch.load(args.checkpoint, map_location='cpu')
+
+    # Debug: Check checkpoint structure
+    print(f"\n  Checkpoint keys: {list(ckpt.keys())}")
+
     state_dict = ckpt.get('state_dict_ema', ckpt.get('state_dict', ckpt))
-    model.load_state_dict(state_dict, strict=False)
+    print(f"  State dict keys (first 10): {list(state_dict.keys())[:10]}")
+    print(f"  Total keys: {len(state_dict)}")
+
+    # Check if projection keys exist
+    input_proj_keys = [k for k in state_dict.keys() if 'input_proj' in k]
+    output_proj_keys = [k for k in state_dict.keys() if 'output_proj' in k]
+    print(f"  Input projection keys: {len(input_proj_keys)}")
+    print(f"  Output projection keys: {len(output_proj_keys)}")
+
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
     print(f"  ✓ Model loaded from {args.checkpoint}")
+    if missing:
+        print(f"  ⚠ Missing keys: {len(missing)}")
+        for k in missing[:3]:
+            print(f"      {k}")
+    if unexpected:
+        print(f"  ⚠ Unexpected keys: {len(unexpected)}")
+        for k in unexpected[:3]:
+            print(f"      {k}")
 
     # Check projection weights
     print("\n  Projection weight stats:")
@@ -136,7 +157,9 @@ def test_projection(args):
         # Input projection
         merged_latent = model.input_proj(input_with_mask)  # (1, 4, h, w)
 
-        print(f"    Merged latent: {merged_latent.shape}, mean={merged_latent.mean():.4f}, std={merged_latent.std():.4f}")
+        print(f"\n    === Latent Statistics ===")
+        print(f"    Input (z_layers): mean={z_layers.mean():.4f}, std={z_layers.std():.4f}, min={z_layers.min():.4f}, max={z_layers.max():.4f}")
+        print(f"    Merged latent: mean={merged_latent.mean():.4f}, std={merged_latent.std():.4f}, min={merged_latent.min():.4f}, max={merged_latent.max():.4f}")
 
         # Decode merged latent
         merged_decoded = vae.decode(merged_latent / scale_factor).sample
@@ -147,7 +170,16 @@ def test_projection(args):
         layers_recon_flat = model.output_proj(merged_latent)  # (1, 24, h, w)
         layers_recon = layers_recon_flat.reshape(1, N, 4, h, w)
 
-        print(f"    Reconstructed layers: {layers_recon.shape}")
+        print(f"    Recon layers: mean={layers_recon.mean():.4f}, std={layers_recon.std():.4f}, min={layers_recon.min():.4f}, max={layers_recon.max():.4f}")
+
+        # Per-layer reconstruction error
+        print(f"\n    === Reconstruction Error (MSE) ===")
+        total_mse = 0
+        for i in range(n_valid):
+            mse = F.mse_loss(layers_recon[0, i], z_layers[0, i]).item()
+            total_mse += mse
+            print(f"    Layer {i}: MSE={mse:.6f}")
+        print(f"    Average MSE: {total_mse / n_valid:.6f}")
 
         # Decode reconstructed layers
         layers_recon_decoded = []
