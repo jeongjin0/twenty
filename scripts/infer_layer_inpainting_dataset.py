@@ -324,6 +324,7 @@ def main():
     parser.add_argument('--image_size', type=int, default=256, help='Image size')
     parser.add_argument('--vae_path', type=str, default='/workspace/twenty/PixArt-alpha/sd-vae-ft-ema')
     parser.add_argument('--t5_path', type=str, default='/workspace/twenty/PixArt-alpha')
+    parser.add_argument('--max_samples', type=int, default=50, help='Max samples to load (for fast testing)')
     args = parser.parse_args()
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -390,7 +391,8 @@ def main():
         max_layers=args.max_layers,
         num_workers=0,
         shuffle=False,
-        caption_type='blip2'
+        caption_type='blip2',
+        max_samples=args.max_samples,
     )
     print(f"  ✓ Dataset loaded: {len(dataloader)} images")
 

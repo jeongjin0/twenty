@@ -37,6 +37,7 @@ class MuLanDataset(Dataset):
         max_layers: int = 8,
         min_layers: int = 2,
         caption_type: str = "blip2",  # "blip2" or "llava"
+        max_samples: Optional[int] = None,  # Limit number of samples for fast loading
     ):
         """
         Args:
@@ -45,16 +46,23 @@ class MuLanDataset(Dataset):
             max_layers: Maximum number of layers to load (pad if fewer)
             min_layers: Minimum number of layers required
             caption_type: Which caption to use ("blip2" or "llava")
+            max_samples: If set, only load this many samples (for fast test/inference)
         """
         self.resolution = resolution
         self.max_layers = max_layers
         self.min_layers = min_layers
         self.caption_type = caption_type
-        
+        self.max_samples = max_samples
+
         # Load metadata and collect image groups
         self.image_groups = self._load_from_csv(data_roots)
         self.image_ids = list(self.image_groups.keys())
-        
+
+        # Limit samples if requested (for fast test/inference)
+        if max_samples is not None and len(self.image_ids) > max_samples:
+            self.image_ids = self.image_ids[:max_samples]
+            print(f"[MuLanDataset] Limited to {max_samples} samples (fast mode)")
+
         print(f"[MuLanDataset] Found {len(self.image_ids)} images")
         print(f"[MuLanDataset] Resolution: {resolution}, Max layers: {max_layers}")
         print(f"[MuLanDataset] Caption type: {caption_type}")
@@ -200,10 +208,11 @@ def build_mulan_dataloader(
     num_workers: int = 4,
     shuffle: bool = True,
     caption_type: str = "blip2",
+    max_samples: Optional[int] = None,
 ) -> DataLoader:
     """
     Build MuLan DataLoader
-    
+
     Args:
         data_roots: List of data directories (each should have meta_data.csv)
         batch_size: Batch size
@@ -213,7 +222,8 @@ def build_mulan_dataloader(
         num_workers: Number of data loading workers
         shuffle: Whether to shuffle data
         caption_type: "blip2" or "llava"
-    
+        max_samples: If set, only load this many samples (for fast test/inference)
+
     Returns:
         DataLoader yielding (B, N, 4, H, W) tensors with captions
     """
@@ -223,6 +233,7 @@ def build_mulan_dataloader(
         max_layers=max_layers,
         min_layers=min_layers,
         caption_type=caption_type,
+        max_samples=max_samples,
     )    
     dataloader = DataLoader(
         dataset,

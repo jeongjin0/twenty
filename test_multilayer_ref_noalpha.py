@@ -321,6 +321,7 @@ def main():
     parser.add_argument('--fixed_seed', action='store_true', help='Use fixed seed across all reference sets to test reference influence')
     parser.add_argument('--debug', action='store_true', help='Print debug information (stats, shapes, etc.)')
     parser.add_argument('--device', type=str, default='cuda', help='Device')
+    parser.add_argument('--max_samples', type=int, default=50, help='Max samples to load (for fast testing)')
 
     args = parser.parse_args()
 
@@ -383,7 +384,8 @@ def main():
         max_layers=getattr(config, 'max_layers', 8),
         num_workers=2,
         shuffle=False,
-        caption_type=getattr(config, 'caption_type', 'blip2')
+        caption_type=getattr(config, 'caption_type', 'blip2'),
+        max_samples=args.max_samples,
     )
 
     # Generate with each reference set

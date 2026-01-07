@@ -180,7 +180,8 @@ def test_pretrained_projection(args):
         max_layers=args.max_layers,
         num_workers=0,
         shuffle=False,
-        caption_type='blip2'
+        caption_type='blip2',
+        max_samples=args.max_samples,
     )
     print(f"  ✓ Dataset loaded")
 
@@ -418,6 +419,7 @@ def main():
     parser.add_argument('--max_layers', type=int, default=6)
     parser.add_argument('--image_size', type=int, default=256)
     parser.add_argument('--vae_path', type=str, default='PixArt-alpha/sd-vae-ft-ema')
+    parser.add_argument('--max_samples', type=int, default=50, help='Max samples to load (for fast testing)')
     args = parser.parse_args()
 
     test_pretrained_projection(args)
